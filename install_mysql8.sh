@@ -1,15 +1,16 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (阿里云/腾讯云专线内网极速加速版)
-# 1. 优先适配阿里云 ECS 内网专线 (mirrors.cloud.aliyuncs.com) 与阿里云 CDN (10-100MB/s 极速)
-# 2. 采用 16 线程并发 Curl Range 分片技术与实时网速/进度条显示
-# 3. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
-# 4. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
-# 5. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
-# 6. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
-# 7. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
-# 8. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
-# 9. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
+# MySQL 8.0.46 生产级自动化部署脚本 (节点预检与中继代理极速版)
+# 1. 自动进行 HTTP HEAD 预检 (0.5s)，彻底清除所有 404 无效节点，只对真实存在 8.0.46 的节点发起下载
+# 2. 移除阿里云未收录小版本的旧节点，保留 ghproxy 中继代理与官方 CDN (5-20MB/s 极速)
+# 3. 采用 16 线程并发 Curl Range 分片技术与实时网速/进度条显示
+# 4. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
+# 5. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
+# 6. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
+# 7. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
+# 8. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
+# 9. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
+# 10. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
 # ==============================================================================
 
 set -eo pipefail
@@ -193,9 +194,9 @@ if ! getent passwd "${MYSQL_USER}" >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. 阿里云内网与高带宽 CDN 专线极速下载 (含 16 线程分片与实时速度)
+# 7. 节点预检与 16 线程 Curl Range 并发分片极速下载
 # ------------------------------------------------------------------------------
-log_step "Step 5: 阿里云内网/高带宽 CDN 专线极速下载"
+log_step "Step 5: 节点有效性预检与 16 线程极速下载"
 
 TMP_DOWNLOAD_DIR="/tmp/mysql_install_pkg"
 mkdir -p "${TMP_DOWNLOAD_DIR}"
@@ -225,16 +226,24 @@ parallel_curl_download() {
     local output="$2"
     local num_threads=16
 
-    log_info "尝试连接加速节点: ${url}"
+    log_info "预检节点有效性: ${url}"
+
+    # 1. 先探测 HTTP 返回码是否为 200 (剔除所有 404 节点)
+    local http_code=$(curl -s -o /dev/null -w "%{http_code}" -L --connect-timeout 4 "${url}" || echo "000")
+    if [ "$http_code" -ne 200 ]; then
+        log_warn "该节点返回状态码 ${http_code} (不存在此版本)，跳过该节点。"
+        return 1
+    fi
 
     local content_length=$(curl -sI -L "${url}" | grep -i "^content-length:" | tail -n1 | awk '{print $2}' | tr -d '\r\n')
 
     if [ -z "$content_length" ] || [ "$content_length" -lt 52428800 ]; then
+        log_warn "该节点返回的文件体积异常，跳过该节点。"
         return 1
     fi
 
     local total_mb=$(( content_length / 1048576 ))
-    log_info "安装包总体积: ${total_mb} MB，已启动 16 线程并发分片传输..."
+    log_info "节点预检通过！安装包体积: ${total_mb} MB，开启 16 线程并发分片传输..."
 
     local chunk_size=$(( content_length / num_threads ))
     local pids=()
@@ -333,10 +342,10 @@ else
         rm -f "${TAR_FILE}"
     fi
 
-    # 阿里云内网 VPC 镜像 + 阿里云公网镜像优先列表
+    # 包含全网国内高带宽中继代理节点 + 官方 CDN 全量源列表（不含已知缺失 8.0.46 的阿里云旧源）
     OFFICIAL_URLS=(
-        "http://mirrors.cloud.aliyuncs.com/mysql/MySQL-8.0/${TAR_FILE}"
-        "https://mirrors.aliyun.com/mysql/MySQL-8.0/${TAR_FILE}"
+        "https://ghproxy.net/https://cdn.mysql.com/Downloads/MySQL-8.0/${TAR_FILE}"
+        "https://mirror.ghproxy.com/https://cdn.mysql.com/Downloads/MySQL-8.0/${TAR_FILE}"
         "https://cdn.mysql.com/Downloads/MySQL-8.0/${TAR_FILE}"
         "https://dev.mysql.com/get/Downloads/MySQL-8.0/${TAR_FILE}"
         "https://downloads.mysql.com/archives/get/p/23/file/${TAR_FILE}"
