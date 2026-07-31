@@ -1,9 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (8 线程黄金并发+伪装 User-Agent 防限速版)
-# 1. 将并发线程优化为 8 线程（TCP 传输黄金平衡点），避免触发 CDN 反刷限流阀值
-# 2. 增加标准 User-Agent 标头伪装，防止 CDN 对裸 curl/脚本连接进行 QoS 压制
-# 3. 将 SSL 握手超时提升至 15 秒，保障国内服务器与官方 CDN 建立稳定连接
+# MySQL 8.0.46 生产级自动化部署脚本 (8 线程黄金并发+初始化陷阱修复版)
+# 1. 修复 my.cnf 中 defaultStorageEngine 拼写错误为 default_storage_engine
+# 2. 修复 set -e 捕获 mysqld --initialize 错误码导致脚本直接静默退出的问题
+# 3. 将并发线程优化为 8 线程（TCP 传输黄金平衡点）并加入 Chrome User-Agent
 # 4. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
 # 5. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
 # 6. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
@@ -396,6 +396,10 @@ tar -xf "${TAR_FILE}" --strip-components=1 -C "${BASE_DIR}"
 mkdir -p "${DATA_DIR}"
 mkdir -p "${LOG_DIR}"
 
+# 清理可能残留的旧数据与日志
+rm -rf "${DATA_DIR:?}"/*
+rm -rf "${LOG_DIR:?}"/*
+
 chown -R ${MYSQL_USER}:${MYSQL_GROUP} "${BASE_DIR}"
 
 # ------------------------------------------------------------------------------
@@ -555,19 +559,25 @@ log_step "Step 7: 初始化数据库"
 INIT_LOG="/tmp/mysql_init.log"
 log_info "正在执行 mysqld --initialize ..."
 
+# 避免 set -e 捕获非零退出码导致脚本提前静默退出
+set +e
 "${INSTALL_DIR}/bin/mysqld" \
     --defaults-file=/etc/my.cnf \
     --initialize \
     --lower-case-table-names=1 \
     --user=${MYSQL_USER} > "${INIT_LOG}" 2>&1
+INIT_RET=$?
+set -e
 
-TEMP_PASSWORD=$(grep "A temporary password" "${INIT_LOG}" | awk '{print $NF}')
+TEMP_PASSWORD=$(grep "A temporary password" "${INIT_LOG}" 2>/dev/null | awk '{print $NF}' || true)
 
-if [ -n "${TEMP_PASSWORD}" ]; then
+if [ -n "${TEMP_PASSWORD}" ] && [ $INIT_RET -eq 0 ]; then
     log_info "数据库初始化成功！"
 else
-    log_err "初始化失败，详情见日志: ${INIT_LOG}"
+    log_err "数据库初始化失败！详情见以下日志输出 (${INIT_LOG}):"
+    echo "--------------------------------------------------------------------------"
     cat "${INIT_LOG}"
+    echo "--------------------------------------------------------------------------"
     exit 1
 fi
 
