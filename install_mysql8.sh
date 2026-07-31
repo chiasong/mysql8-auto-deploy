@@ -1,17 +1,18 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (EPEL源+openssl11+libaio共享库全向修复版)
-# 1. 自动启用 EPEL 源，全自动安装 openssl11-libs、openssl11、libaio-devel 等系统底层依赖
-# 2. 动态扫描补全 libaio.so.1 与 libssl.so.1.1 共享库软链接，兼容 CentOS/RHEL/Rocky/Ubuntu/Debian
-# 3. 修复 my.cnf 中 defaultStorageEngine 拼写错误为 default_storage_engine
-# 4. 将并发线程优化为 8 线程（TCP 传输黄金平衡点）并加入 Chrome User-Agent 伪装
-# 5. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
-# 6. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
-# 7. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
-# 8. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
-# 9. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
-# 10. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
-# 11. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
+# MySQL 8.0.46 生产级自动化部署脚本 (libaio 单独立即修复与共享库全向兼容版)
+# 1. 拆分 yum/apt 依赖包为独立原子安装，解决因单个可选包名称不存在导致整体依赖安装失败的问题
+# 2. 强制单独安装 libaio 与 libaio-devel / libaio1 / libaio1t64
+# 3. 深度全局扫描系统 libaio 库文件，全自动建立 /lib64, /usr/lib64, /usr/lib 底层软链接
+# 4. 自动启用 EPEL 源并独立安装 openssl11-libs、numactl、ncurses
+# 5. 修复 my.cnf 中 default_storage_engine 参数
+# 6. 8 线程黄金并发+伪装 Chrome User-Agent 防限速
+# 7. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
+# 8. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
+# 9. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
+# 10. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
+# 11. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
+# 12. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
 # ==============================================================================
 
 set -eo pipefail
@@ -167,64 +168,72 @@ log_info "系统总物理内存: ${TOTAL_MEM_MB} MB"
 log_info "自动匹配 InnoDB Buffer Pool: ${BUFFER_POOL_SIZE} (Instances: ${BUFFER_POOL_INSTANCES})"
 
 # ------------------------------------------------------------------------------
-# 5. 安装基础依赖 (含 EPEL 源、openssl11-libs、libaio、numactl、ncurses)
+# 5. 安装基础依赖与 libaio/openssl 专项补全
 # ------------------------------------------------------------------------------
-log_step "Step 3: 安装基础依赖软件包与 EPEL 加速组件"
+log_step "Step 3: 安装基础依赖软件包与 libaio 专项补全"
 
 install_dependencies() {
     if command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
         local pkg_mgr=$(command -v dnf || command -v yum)
-        log_info "检测到 RHEL/CentOS/Rocky 系统，正在配置 EPEL 源与 openssl11-libs 依赖..."
+        log_info "检测到 RHEL/CentOS/Rocky 系统，逐个安装核心依赖..."
         
-        # 安装 EPEL 源
-        $pkg_mgr install -y epel-release >/dev/null 2>&1 || true
-        
-        # 安装 libaio 及 openssl11 组件
-        $pkg_mgr install -y \
-            wget tar xz libaio libaio-devel \
-            openssl11-libs openssl11 openssl-devel \
-            numactl-libs numactl \
-            ncurses-compat-libs ncurses-libs >/dev/null 2>&1 || \
-        $pkg_mgr install -y \
-            wget tar xz libaio \
-            numactl ncurses >/dev/null 2>&1 || true
+        # 逐个独立安装，防止单个包缺失导致整体被 Yum 终止
+        $pkg_mgr install -y wget || true
+        $pkg_mgr install -y tar || true
+        $pkg_mgr install -y xz || true
+        $pkg_mgr install -y libaio || true
+        $pkg_mgr install -y libaio-devel || true
+        $pkg_mgr install -y numactl || true
+        $pkg_mgr install -y numactl-libs || true
+        $pkg_mgr install -y epel-release || true
+        $pkg_mgr install -y openssl11-libs || true
+        $pkg_mgr install -y openssl11 || true
+        $pkg_mgr install -y ncurses-compat-libs || true
+        $pkg_mgr install -y ncurses-libs || true
 
     elif command -v apt-get >/dev/null 2>&1; then
-        log_info "检测到 Debian/Ubuntu 系统，正在配置基础依赖..."
-        apt-get update -y >/dev/null 2>&1 || true
-        apt-get install -y \
-            wget tar xz-utils libaio1 libaio-dev \
-            libssl-dev openssl \
-            numactl libnuma1 \
-            libncurses5 libncursesw5 >/dev/null 2>&1 || \
-        apt-get install -y \
-            wget tar xz-utils libaio1t64 \
-            numactl libncurses5 >/dev/null 2>&1 || true
+        log_info "检测到 Debian/Ubuntu 系统，逐个安装核心依赖..."
+        apt-get update -y || true
+        apt-get install -y wget || true
+        apt-get install -y tar || true
+        apt-get install -y xz-utils || true
+        apt-get install -y libaio1 || true
+        apt-get install -y libaio-dev || true
+        apt-get install -y libaio1t64 || true
+        apt-get install -y numactl || true
+        apt-get install -y libnuma1 || true
+        apt-get install -y libssl-dev || true
+        apt-get install -y openssl || true
+        apt-get install -y libncurses5 || true
+        apt-get install -y libncursesw5 || true
     fi
 
-    # 动态检查并自动补全 libaio.so.1 与 libssl.so.1.1 软链接
-    log_info "自动检查并修复底层共享库 (libaio.so.1 / libssl.so.1.1) 软链接..."
+    # 动态扫描系统已有的 libaio 文件并强制补全全路径软链接
+    log_info "全局扫描系统 libaio 共享库并自动建链..."
+    local aio_target=""
+    aio_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libaio.so*" 2>/dev/null | head -n 1 || true)
 
-    # 修复 libaio.so.1
-    if ! ldconfig -p 2>/dev/null | grep -q "libaio.so.1"; then
-        local aio_target=$(find /usr/lib64 /lib64 /usr/lib /lib -name "libaio.so*" 2>/dev/null | head -n 1 || true)
-        if [ -n "$aio_target" ]; then
-            ln -sf "$aio_target" /usr/lib64/libaio.so.1 2>/dev/null || true
-            ln -sf "$aio_target" /usr/lib/libaio.so.1 2>/dev/null || true
-            ln -sf "$aio_target" /lib64/libaio.so.1 2>/dev/null || true
-            ln -sf "$aio_target" /usr/lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true
-        fi
+    if [ -n "$aio_target" ]; then
+        log_info "系统已找到 libaio 共享库: ${aio_target}，自动创建全局链接..."
+        ln -sf "$aio_target" /usr/lib64/libaio.so.1 2>/dev/null || true
+        ln -sf "$aio_target" /lib64/libaio.so.1 2>/dev/null || true
+        ln -sf "$aio_target" /usr/lib/libaio.so.1 2>/dev/null || true
+        ln -sf "$aio_target" /lib/libaio.so.1 2>/dev/null || true
+        ln -sf "$aio_target" /usr/lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true
+        ln -sf "$aio_target" /lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true
+    else
+        log_warn "未能在常用路径中找到 libaio.so，若下一步报错将自动进行补丁链接处理。"
     fi
 
-    # 修复 libssl.so.1.1
-    if ! ldconfig -p 2>/dev/null | grep -q "libssl.so.1.1"; then
-        local ssl_target=$(find /usr/lib64 /lib64 /usr/lib /lib -name "libssl.so.1.1*" 2>/dev/null | head -n 1 || true)
-        if [ -n "$ssl_target" ]; then
-            ln -sf "$ssl_target" /usr/lib64/libssl.so.1.1 2>/dev/null || true
-            ln -sf "$ssl_target" /usr/lib/libssl.so.1.1 2>/dev/null || true
-            ln -sf "$ssl_target" /lib64/libssl.so.1.1 2>/dev/null || true
-            ln -sf "$ssl_target" /usr/lib/x86_64-linux-gnu/libssl.so.1.1 2>/dev/null || true
-        fi
+    # 动态扫描系统已有的 libssl.so.1.1 文件并建链
+    local ssl_target=""
+    ssl_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libssl.so.1.1*" 2>/dev/null | head -n 1 || true)
+    if [ -n "$ssl_target" ]; then
+        ln -sf "$ssl_target" /usr/lib64/libssl.so.1.1 2>/dev/null || true
+        ln -sf "$ssl_target" /lib64/libssl.so.1.1 2>/dev/null || true
+        ln -sf "$ssl_target" /usr/lib/libssl.so.1.1 2>/dev/null || true
+        ln -sf "$ssl_target" /lib/libssl.so.1.1 2>/dev/null || true
+        ln -sf "$ssl_target" /usr/lib/x86_64-linux-gnu/libssl.so.1.1 2>/dev/null || true
     fi
 
     ldconfig >/dev/null 2>&1 || true
