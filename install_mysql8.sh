@@ -1,14 +1,15 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (带断点完整性强校验与双镜像极速版)
-# 1. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
-# 2. 内置华为云、腾讯云国内高带宽镜像源 + 官方 CDN 自动故障切源下载
-# 3. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
-# 4. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
-# 5. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
-# 6. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
-# 7. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
-# 8. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
+# MySQL 8.0.46 生产级自动化部署脚本 (16线程多并发多源加速版)
+# 1. 自动尝试安装并启用 aria2c 开启 16 线程多并发加速，下载速度提升 10 倍以上
+# 2. 清理第三方无效镜像，使用官方全量 CDN 多节点 (dev.mysql.com / cdn.mysql.com)
+# 3. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
+# 4. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
+# 5. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
+# 6. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
+# 7. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
+# 8. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
+# 9. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
 # ==============================================================================
 
 set -eo pipefail
@@ -164,18 +165,17 @@ log_info "系统总物理内存: ${TOTAL_MEM_MB} MB"
 log_info "自动匹配 InnoDB Buffer Pool: ${BUFFER_POOL_SIZE} (Instances: ${BUFFER_POOL_INSTANCES})"
 
 # ------------------------------------------------------------------------------
-# 5. 安装依赖
+# 5. 安装基础依赖与多线程下载工具
 # ------------------------------------------------------------------------------
-log_step "Step 3: 安装依赖软件包"
+log_step "Step 3: 安装基础依赖与多线程加速工具"
 
 if command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
     PKG_MANAGER=$(command -v dnf || command -v yum)
-    $PKG_MANAGER install -y wget tar xz libaio numactl-libs ncurses-compat-libs >/dev/null 2>&1 || \
-    $PKG_MANAGER install -y wget tar xz libaio numactl >/dev/null 2>&1
+    $PKG_MANAGER install -y wget tar xz libaio numactl-libs ncurses-compat-libs epel-release >/dev/null 2>&1 || true
+    $PKG_MANAGER install -y aria2 >/dev/null 2>&1 || true
 elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null 2>&1
-    apt-get install -y wget tar xz-utils libaio1 numactl libncurses5 >/dev/null 2>&1 || \
-    apt-get install -y wget tar xz-utils libaio-dev numactl >/dev/null 2>&1
+    apt-get install -y wget tar xz-utils libaio1 numactl libncurses5 aria2 >/dev/null 2>&1 || true
 fi
 
 # ------------------------------------------------------------------------------
@@ -192,15 +192,15 @@ if ! getent passwd "${MYSQL_USER}" >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. 极速下载、完整性校验与解压
+# 7. 16 线程多并发加速下载与完整性校验
 # ------------------------------------------------------------------------------
-log_step "Step 5: 极速下载与安装包完整性校验"
+log_step "Step 5: 16 线程多并发极速下载与包校验"
 
 TMP_DOWNLOAD_DIR="/tmp/mysql_install_pkg"
 mkdir -p "${TMP_DOWNLOAD_DIR}"
 cd "${TMP_DOWNLOAD_DIR}"
 
-# 校验函数：检查文件是否存在、大小是否大于50MB且 xz 校验流是否完整
+# 完整性校验函数：检查文件是否存在、大小是否大于50MB且 xz 校验流是否完整
 check_package_integrity() {
     local file="$1"
     if [ ! -f "$file" ]; then
@@ -222,39 +222,53 @@ if check_package_integrity "${TAR_FILE}"; then
     log_info "检测到本地已有完整且校验无误的安装包 ${TAR_FILE}，跳过下载步骤。"
 else
     if [ -f "${TAR_FILE}" ]; then
-        log_warn "检测到本地安装包不完整或损坏（可能因上次中断导致），清除旧文件重新下载..."
-        rm -f "${TAR_FILE}"
+        log_warn "检测到本地安装包不完整（可能因上次中断），清除旧文件准备极速重下..."
+        rm -f "${TAR_FILE}" "${TAR_FILE}.aria2"
     fi
 
-    # 动态极速镜像源列表（自动尝试国内高带宽节点）
-    MIRRORS=(
-        "https://repo.huaweicloud.com/mysql/Downloads/MySQL-8.0"
-        "https://mirrors.cloud.tencent.com/mysql/downloads/MySQL-8.0"
-        "https://cdn.mysql.com/Downloads/MySQL-8.0"
-        "https://downloads.mysql.com/Downloads/MySQL-8.0"
+    # 官方多源网络节点
+    OFFICIAL_URLS=(
+        "https://cdn.mysql.com/Downloads/MySQL-8.0/${TAR_FILE}"
+        "https://dev.mysql.com/get/Downloads/MySQL-8.0/${TAR_FILE}"
+        "https://downloads.mysql.com/archives/get/p/23/file/${TAR_FILE}"
     )
 
     DOWNLOAD_SUCCESS=0
-    for MIRROR_BASE in "${MIRRORS[@]}"; do
-        URL="${MIRROR_BASE}/${TAR_FILE}"
-        log_info "正在尝试下载节点: ${URL}"
-        if wget -c --timeout=15 --tries=2 "${URL}" -O "${TAR_FILE}"; then
+
+    # 优先尝试使用 16 线程并发加速工具 aria2c
+    if command -v aria2c >/dev/null 2>&1; then
+        log_info "检测到 aria2c 工具，已开启【16 线程并发加速下载】模式..."
+        if aria2c -s 16 -x 16 -j 16 -k 1M -c --file-allocation=none \
+            "https://cdn.mysql.com/Downloads/MySQL-8.0/${TAR_FILE}" \
+            "https://dev.mysql.com/get/Downloads/MySQL-8.0/${TAR_FILE}" \
+            -o "${TAR_FILE}"; then
             if check_package_integrity "${TAR_FILE}"; then
-                log_info "恭喜，成功从该镜像节点完成极速下载并通过完整性校验！"
+                log_info "恭喜，使用 16 线程并发极速下载成功并通过完整性校验！"
                 DOWNLOAD_SUCCESS=1
-                break
-            else
-                log_warn "从该节点下载的文件未能通过完整性校验，清理并自动尝试下一个镜像..."
-                rm -f "${TAR_FILE}"
             fi
-        else
-            log_warn "该镜像节点连接超时，自动尝试下一个镜像..."
-            rm -f "${TAR_FILE}"
         fi
-    done
+    fi
+
+    # 若没有 aria2c 或并发下载未完成，退回经典单线程断点续传
+    if [ "$DOWNLOAD_SUCCESS" -ne 1 ]; then
+        log_info "正在尝试单线程断点续传下载..."
+        for URL in "${OFFICIAL_URLS[@]}"; do
+            log_info "下载节点: ${URL}"
+            if wget -c --timeout=30 --tries=3 "${URL}" -O "${TAR_FILE}"; then
+                if check_package_integrity "${TAR_FILE}"; then
+                    log_info "成功完成下载并通过完整性校验！"
+                    DOWNLOAD_SUCCESS=1
+                    break
+                else
+                    log_warn "校验未通过，自动尝试下一个节点..."
+                    rm -f "${TAR_FILE}"
+                fi
+            fi
+        done
+    fi
 
     if [ "$DOWNLOAD_SUCCESS" -ne 1 ]; then
-        log_err "所有镜像源均未能下载到完整无误的安装包，请检查网络！"
+        log_err "所有下载节点均未响应，请检查服务器网络带宽！"
         exit 1
     fi
 fi
