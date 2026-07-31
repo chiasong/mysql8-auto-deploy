@@ -1,19 +1,20 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (初始化 --console 探针与空日志破解版)
-# 1. 【初始化探针】增加 --console 参数，强制 mysqld --initialize 将临时密码与报错推送到 stderr
-# 2. 【双重日志扫描】同时扫描 /tmp/mysql_init.log 与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
-# 3. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
-# 4. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
-# 5. 【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立：
+# MySQL 8.0.46 生产级自动化部署脚本 (防止死循环自引用软链接终极修复版)
+# 1. 【软链接防死循环】设计安全建链函数 safe_symlink，彻底根治 libaio.so.1 -> libaio.so.1 循环指向 Bug
+# 2. 【实体文件过滤】find 命令强制使用 -type f -name "libaio.so*" ! -name "libaio.so.1" 仅匹配真实文件
+# 3. 【初始化探针】增加 --console 参数，强制 mysqld --initialize 将临时密码与报错推送到 stderr
+# 4. 【双重日志扫描】同时扫描 /tmp/mysql_init.log 与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
+# 5. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
+# 6. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
+# 7. 【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立：
 #    - ln -s libaio.so.1t64.0.2 /usr/lib/x86_64-linux-gnu/libaio.so.1
 #    - ln -s libncurses.so.6.4 /usr/lib/x86_64-linux-gnu/libncurses.so.6
-# 6. 【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
-# 7. 【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
-# 8. 【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
-# 9. 【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
-# 10.【配置调优】修复 default_storage_engine，自动匹配物理内存分配 InnoDB Buffer Pool
-# 11.【安全隔离】自动生成 12 位随机高强度密码，开启 root@% 远程访问 (mysql_native_password)
+# 8. 【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
+# 9. 【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
+# 10.【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
+# 11.【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
+# 12.【安全隔离】自动生成 12 位随机高强度密码，开启 root@% 远程访问 (mysql_native_password)
 # ==============================================================================
 
 set -eo pipefail
@@ -181,11 +182,52 @@ log_info "系统总物理内存: ${TOTAL_MEM_MB} MB"
 log_info "自动匹配 InnoDB Buffer Pool: ${BUFFER_POOL_SIZE} (Instances: ${BUFFER_POOL_INSTANCES})"
 
 # ------------------------------------------------------------------------------
-# 5. 安装基础依赖（融入 RedHat/Debian/Ubuntu24 特殊解法）
+# 5. 安全创建软链接函数 (防止指向自身导致死循环)
+# ------------------------------------------------------------------------------
+safe_symlink() {
+    local src_file="$1"
+    local dest_link="$2"
+
+    if [ -z "${src_file}" ] || [ -z "${dest_link}" ]; then
+        return 0
+    fi
+
+    # 如果源文件根本不存在，直接跳过
+    if [ ! -f "${src_file}" ] && [ ! -L "${src_file}" ]; then
+        return 0
+    fi
+
+    # 绝对路径规范化
+    local real_src=$(readlink -f "${src_file}" 2>/dev/null || echo "${src_file}")
+    local real_dest_dir=$(dirname "${dest_link}")
+
+    # 防止盲目循环建立指向自身的软链接 (例如 /usr/lib64/libaio.so.1 -> /usr/lib64/libaio.so.1)
+    if [ "${src_file}" = "${dest_link}" ] || [ "${real_src}" = "${dest_link}" ]; then
+        return 0
+    fi
+
+    mkdir -p "${real_dest_dir}" 2>/dev/null || true
+    rm -f "${dest_link}" 2>/dev/null || true
+    ln -sf "${real_src}" "${dest_link}" 2>/dev/null || true
+    log_info "建立安全软链接: ${dest_link} -> ${real_src}"
+}
+
+# ------------------------------------------------------------------------------
+# 6. 安装基础依赖（融入 RedHat/Debian/Ubuntu24 特殊解法）
 # ------------------------------------------------------------------------------
 log_step "Step 3: 安装基础依赖与全平台 libaio 库支持"
 
 install_dependencies() {
+    # 彻底清理之前可能残存的死循环自引用软链接
+    for bad_link in /usr/lib64/libaio.so.1 /lib64/libaio.so.1 /usr/lib/libaio.so.1 /lib/libaio.so.1 /usr/lib/x86_64-linux-gnu/libaio.so.1 /usr/lib/aarch64-linux-gnu/libaio.so.1; do
+        if [ -L "${bad_link}" ]; then
+            local target=$(readlink "${bad_link}" 2>/dev/null || true)
+            if [ "${target}" = "${bad_link}" ] || [ "${target}" = "libaio.so.1" ]; then
+                rm -f "${bad_link}" 2>/dev/null || true
+            fi
+        fi
+    done
+
     # 调整系统 limits.conf
     if [ -f /etc/security/limits.conf ]; then
         if ! grep -q "mysql soft nofile" /etc/security/limits.conf; then
@@ -236,8 +278,9 @@ EOF
         apt-get install -y libncursesw5 || true
     fi
 
-    log_info "自动建立针对 Ubuntu 24 及通用系统的 libaio.so.1 & libncurses.so.6 软链接..."
+    log_info "安全校验并构建针对 Ubuntu 24 及通用系统的 libaio.so.1 & libncurses.so.6 软链接..."
 
+    # Ubuntu 24/22 特性路径软链接
     local target_arch_dir=""
     case "${ARCH}" in
         x86_64|amd64) target_arch_dir="/usr/lib/x86_64-linux-gnu" ;;
@@ -245,42 +288,40 @@ EOF
     esac
 
     if [ -n "${target_arch_dir}" ] && [ -d "${target_arch_dir}" ]; then
-        cd "${target_arch_dir}"
-        
-        local t64_lib=$(find "${target_arch_dir}" -name "libaio.so.1t64*" 2>/dev/null | head -n 1 || true)
+        local t64_lib=$(find "${target_arch_dir}" -type f -name "libaio.so.1t64*" 2>/dev/null | head -n 1 || true)
         if [ -n "${t64_lib}" ]; then
-            ln -sf "${t64_lib}" libaio.so.1 2>/dev/null || true
-            log_info "Ubuntu 24 特性处理完成: ${t64_lib} -> ${target_arch_dir}/libaio.so.1"
+            safe_symlink "${t64_lib}" "${target_arch_dir}/libaio.so.1"
         fi
 
-        local nc6_lib=$(find "${target_arch_dir}" -name "libncurses.so.6*" 2>/dev/null | head -n 1 || true)
+        local nc6_lib=$(find "${target_arch_dir}" -type f -name "libncurses.so.6*" 2>/dev/null | head -n 1 || true)
         if [ -n "${nc6_lib}" ]; then
-            ln -sf "${nc6_lib}" libncurses.so.6 2>/dev/null || true
-            ln -sf "${nc6_lib}" libncurses.so.5 2>/dev/null || true
-            log_info "Ubuntu 24 特性处理完成: ${nc6_lib} -> ${target_arch_dir}/libncurses.so.6"
+            safe_symlink "${nc6_lib}" "${target_arch_dir}/libncurses.so.6"
+            safe_symlink "${nc6_lib}" "${target_arch_dir}/libncurses.so.5"
         fi
     fi
 
-    local aio_target=""
-    aio_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -name "libaio.so*" 2>/dev/null | head -n 1 || true)
+    # 全局安全查找真实物理文件 (-type f) 并排除软链接本身
+    local real_aio_file=""
+    real_aio_file=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -type f -name "libaio.so*" ! -name "libaio.so.1" 2>/dev/null | head -n 1 || true)
 
-    if [ -n "$aio_target" ]; then
-        ln -sf "$aio_target" /usr/lib64/libaio.so.1 2>/dev/null || true
-        ln -sf "$aio_target" /lib64/libaio.so.1 2>/dev/null || true
-        ln -sf "$aio_target" /usr/lib/libaio.so.1 2>/dev/null || true
-        ln -sf "$aio_target" /lib/libaio.so.1 2>/dev/null || true
-        if [ -d "/usr/lib/x86_64-linux-gnu" ]; then ln -sf "$aio_target" /usr/lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true; fi
-        if [ -d "/usr/lib/aarch64-linux-gnu" ]; then ln -sf "$aio_target" /usr/lib/aarch64-linux-gnu/libaio.so.1 2>/dev/null || true; fi
+    if [ -n "${real_aio_file}" ]; then
+        safe_symlink "${real_aio_file}" /usr/lib64/libaio.so.1
+        safe_symlink "${real_aio_file}" /lib64/libaio.so.1
+        safe_symlink "${real_aio_file}" /usr/lib/libaio.so.1
+        safe_symlink "${real_aio_file}" /lib/libaio.so.1
+        if [ -d "/usr/lib/x86_64-linux-gnu" ]; then safe_symlink "${real_aio_file}" /usr/lib/x86_64-linux-gnu/libaio.so.1; fi
+        if [ -d "/usr/lib/aarch64-linux-gnu" ]; then safe_symlink "${real_aio_file}" /usr/lib/aarch64-linux-gnu/libaio.so.1; fi
     fi
 
-    local ssl_target=""
-    ssl_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -name "libssl.so.1.1*" 2>/dev/null | head -n 1 || true)
-    if [ -n "$ssl_target" ]; then
-        ln -sf "$ssl_target" /usr/lib64/libssl.so.1.1 2>/dev/null || true
-        ln -sf "$ssl_target" /lib64/libssl.so.1.1 2>/dev/null || true
-        ln -sf "$ssl_target" /usr/lib/libssl.so.1.1 2>/dev/null || true
-        ln -sf "$ssl_target" /lib/libssl.so.1.1 2>/dev/null || true
-        if [ -d "/usr/lib/x86_64-linux-gnu" ]; then ln -sf "$ssl_target" /usr/lib/x86_64-linux-gnu/libssl.so.1.1 2>/dev/null || true; fi
+    # 全局安全查找 OpenSSL 1.1 实体文件并补全软链接
+    local real_ssl_file=""
+    real_ssl_file=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -type f -name "libssl.so.1.1*" ! -name "libssl.so.1.1" 2>/dev/null | head -n 1 || true)
+    if [ -n "${real_ssl_file}" ]; then
+        safe_symlink "${real_ssl_file}" /usr/lib64/libssl.so.1.1
+        safe_symlink "${real_ssl_file}" /lib64/libssl.so.1.1
+        safe_symlink "${real_ssl_file}" /usr/lib/libssl.so.1.1
+        safe_symlink "${real_ssl_file}" /lib/libssl.so.1.1
+        if [ -d "/usr/lib/x86_64-linux-gnu" ]; then safe_symlink "${real_ssl_file}" /usr/lib/x86_64-linux-gnu/libssl.so.1.1; fi
     fi
 
     ldconfig >/dev/null 2>&1 || true
@@ -289,7 +330,7 @@ EOF
 install_dependencies
 
 # ------------------------------------------------------------------------------
-# 6. 创建 mysql 用户与组
+# 7. 创建 mysql 用户与组
 # ------------------------------------------------------------------------------
 log_step "Step 4: 创建 mysql 用户与组"
 
@@ -302,7 +343,7 @@ if ! getent passwd "${MYSQL_USER}" >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. 8 线程黄金并发 Curl Range 分片极速下载 (伪装 User-Agent)
+# 8. 8 线程黄金并发 Curl Range 分片极速下载 (伪装 User-Agent)
 # ------------------------------------------------------------------------------
 log_step "Step 5: 8 线程黄金并发分片下载"
 
@@ -509,7 +550,7 @@ rm -rf "${LOG_DIR:?}"/*
 chown -R ${MYSQL_USER}:${MYSQL_GROUP} "${BASE_DIR}"
 
 # ------------------------------------------------------------------------------
-# 8. 写入生产调优版 /etc/my.cnf 配置文件
+# 9. 写入生产调优版 /etc/my.cnf 配置文件
 # ------------------------------------------------------------------------------
 log_step "Step 6: 生成生产级配置文件 /etc/my.cnf"
 
@@ -658,7 +699,7 @@ EOF
 log_info "配置文件 /etc/my.cnf 生成成功！"
 
 # ------------------------------------------------------------------------------
-# 9. 初始化数据库 (带 --lower-case-table-names=1 与 --console 探针)
+# 10. 初始化数据库 (带 --lower-case-table-names=1 与 --console 探针)
 # ------------------------------------------------------------------------------
 log_step "Step 7: 初始化数据库"
 
@@ -694,7 +735,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 10. 配置环境变量、Systemd 服务与防火墙自动放行
+# 11. 配置环境变量、Systemd 服务与防火墙自动放行
 # ------------------------------------------------------------------------------
 log_step "Step 8: 配置环境变量、注册服务与防火墙端口放行"
 
@@ -749,7 +790,7 @@ elif command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
 fi
 
 # ------------------------------------------------------------------------------
-# 11. Socket 就绪轮询与修改 root 密码及远程权限
+# 12. Socket 就绪轮询与修改 root 密码及远程权限
 # ------------------------------------------------------------------------------
 log_step "Step 9: Socket 就绪轮询、修改 root 密码并开启外部远程访问"
 
@@ -793,7 +834,7 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# 12. 完成输出
+# 13. 完成输出
 # ------------------------------------------------------------------------------
 log_step "部署完成！"
 
