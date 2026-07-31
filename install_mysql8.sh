@@ -1,12 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (完美适配各种生产环境)
-# 1. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
-# 2. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
-# 3. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
-# 4. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
-# 5. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
-# 6. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
+# MySQL 8.0.46 生产级自动化部署脚本 (带断点完整性强校验与双镜像极速版)
+# 1. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
+# 2. 内置华为云、腾讯云国内高带宽镜像源 + 官方 CDN 自动故障切源下载
+# 3. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
+# 4. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
+# 5. 自动识别 glibc 版本与 CPU 架构，拉取匹配的 MySQL 8.0.46 官方二进制包
+# 6. 自动识别服务器物理内存，智能计算并配置 InnoDB Buffer Pool 大小
+# 7. 自动生成 12 位随机高强度密码，自动修改 root 密码并开启外部远程访问
+# 8. 整合全面调优的 my.cnf，安全支持 lower_case_table_names=1 初始化
 # ==============================================================================
 
 set -eo pipefail
@@ -17,7 +19,6 @@ set -eo pipefail
 MYSQL_VERSION="8.0.46"
 MYSQL_USER="mysql"
 MYSQL_GROUP="mysql"
-BASE_DOWNLOAD_URL="https://cdn.mysql.com/Downloads/MySQL-8.0"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -140,7 +141,6 @@ case "$ARCH" in
 esac
 
 TAR_FILE="mysql-${MYSQL_VERSION}-linux-${GLIBC_TAG}-${ARCH_TAG}.tar.xz"
-FULL_DOWNLOAD_URL="${BASE_DOWNLOAD_URL}/${TAR_FILE}"
 
 # 智能识别内存并分配 InnoDB Buffer Pool
 TOTAL_MEM_MB=$(free -m | awk '/^Mem:/{print $2}')
@@ -192,22 +192,71 @@ if ! getent passwd "${MYSQL_USER}" >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. 下载解压与目录建立
+# 7. 极速下载、完整性校验与解压
 # ------------------------------------------------------------------------------
-log_step "Step 5: 下载并解压安装包"
+log_step "Step 5: 极速下载与安装包完整性校验"
 
 TMP_DOWNLOAD_DIR="/tmp/mysql_install_pkg"
 mkdir -p "${TMP_DOWNLOAD_DIR}"
 cd "${TMP_DOWNLOAD_DIR}"
 
-if [ -f "${TAR_FILE}" ]; then
-    log_info "发现本地已有安装包 ${TAR_FILE}，跳过下载..."
+# 校验函数：检查文件是否存在、大小是否大于50MB且 xz 校验流是否完整
+check_package_integrity() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        return 1
+    fi
+    local file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    if [ "$file_size" -lt 52428800 ]; then
+        return 1
+    fi
+    if command -v xz >/dev/null 2>&1; then
+        xz -t "$file" >/dev/null 2>&1 && return 0 || return 1
+    elif command -v tar >/dev/null 2>&1; then
+        tar -tf "$file" >/dev/null 2>&1 && return 0 || return 1
+    fi
+    return 0
+}
+
+if check_package_integrity "${TAR_FILE}"; then
+    log_info "检测到本地已有完整且校验无误的安装包 ${TAR_FILE}，跳过下载步骤。"
 else
-    log_info "正在从 CDN 下载安装包..."
-    wget -c "${FULL_DOWNLOAD_URL}" -O "${TAR_FILE}" || {
-        log_err "下载失败，请检查网络: ${FULL_DOWNLOAD_URL}"
+    if [ -f "${TAR_FILE}" ]; then
+        log_warn "检测到本地安装包不完整或损坏（可能因上次中断导致），清除旧文件重新下载..."
+        rm -f "${TAR_FILE}"
+    fi
+
+    # 动态极速镜像源列表（自动尝试国内高带宽节点）
+    MIRRORS=(
+        "https://repo.huaweicloud.com/mysql/Downloads/MySQL-8.0"
+        "https://mirrors.cloud.tencent.com/mysql/downloads/MySQL-8.0"
+        "https://cdn.mysql.com/Downloads/MySQL-8.0"
+        "https://downloads.mysql.com/Downloads/MySQL-8.0"
+    )
+
+    DOWNLOAD_SUCCESS=0
+    for MIRROR_BASE in "${MIRRORS[@]}"; do
+        URL="${MIRROR_BASE}/${TAR_FILE}"
+        log_info "正在尝试下载节点: ${URL}"
+        if wget -c --timeout=15 --tries=2 "${URL}" -O "${TAR_FILE}"; then
+            if check_package_integrity "${TAR_FILE}"; then
+                log_info "恭喜，成功从该镜像节点完成极速下载并通过完整性校验！"
+                DOWNLOAD_SUCCESS=1
+                break
+            else
+                log_warn "从该节点下载的文件未能通过完整性校验，清理并自动尝试下一个镜像..."
+                rm -f "${TAR_FILE}"
+            fi
+        else
+            log_warn "该镜像节点连接超时，自动尝试下一个镜像..."
+            rm -f "${TAR_FILE}"
+        fi
+    done
+
+    if [ "$DOWNLOAD_SUCCESS" -ne 1 ]; then
+        log_err "所有镜像源均未能下载到完整无误的安装包，请检查网络！"
         exit 1
-    }
+    fi
 fi
 
 log_info "正在解压并部署至路径 ${BASE_DIR} ..."
