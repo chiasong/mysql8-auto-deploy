@@ -21,13 +21,16 @@
 
 ## 🚀 快速开始
 
-### 极速一键安装
+在 Linux 服务器终端执行以下一键安装命令（根据网络选择 **Gitee** 或 **GitHub** 镜像）：
 
-在 Linux 服务器终端执行以下命令：
-
+### 选项 A：Gitee 镜像节点（推荐国内服务器）
 ```bash
-# 从仓库一键下载并启动安装
-wget -O install_mysql8.sh https://gitee.com/<您的Gitee用户名>/mysql8-auto-deploy/raw/main/install_mysql8.sh && chmod +x install_mysql8.sh && sudo ./install_mysql8.sh
+wget -O install_mysql8.sh https://gitee.com/chiasong/mysql8-auto-deploy/raw/main/install_mysql8.sh && chmod +x install_mysql8.sh && sudo ./install_mysql8.sh
+```
+
+### 选项 B：GitHub 节点（推荐海外服务器）
+```bash
+wget -O install_mysql8.sh https://raw.githubusercontent.com/chiasong/mysql8-auto-deploy/main/install_mysql8.sh && chmod +x install_mysql8.sh && sudo ./install_mysql8.sh
 ```
 
 ---
