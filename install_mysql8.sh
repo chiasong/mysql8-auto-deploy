@@ -1,8 +1,8 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (16并发Curl分片+动态实时网速显示版)
-# 1. 采用零依赖 16 线程并发 Curl Range 分片技术，突破单连接带宽限制（速提 10-15 倍）
-# 2. 动态实时刷新显示 16 线程下载进度条、已下载 MB数、百分比及实时网速 (MB/s)
+# MySQL 8.0.46 生产级自动化部署脚本 (阿里云/腾讯云专线内网极速加速版)
+# 1. 优先适配阿里云 ECS 内网专线 (mirrors.cloud.aliyuncs.com) 与阿里云 CDN (10-100MB/s 极速)
+# 2. 采用 16 线程并发 Curl Range 分片技术与实时网速/进度条显示
 # 3. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
 # 4. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
 # 5. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
@@ -193,9 +193,9 @@ if ! getent passwd "${MYSQL_USER}" >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. 内置 16 线程 Curl Range 并发分片极速下载 (带实时网速与进度条显示)
+# 7. 阿里云内网与高带宽 CDN 专线极速下载 (含 16 线程分片与实时速度)
 # ------------------------------------------------------------------------------
-log_step "Step 5: 开启 16 线程内建并发极速下载"
+log_step "Step 5: 阿里云内网/高带宽 CDN 专线极速下载"
 
 TMP_DOWNLOAD_DIR="/tmp/mysql_install_pkg"
 mkdir -p "${TMP_DOWNLOAD_DIR}"
@@ -225,7 +225,7 @@ parallel_curl_download() {
     local output="$2"
     local num_threads=16
 
-    log_info "连接 CDN 节点: ${url}"
+    log_info "尝试连接加速节点: ${url}"
 
     local content_length=$(curl -sI -L "${url}" | grep -i "^content-length:" | tail -n1 | awk '{print $2}' | tr -d '\r\n')
 
@@ -234,7 +234,7 @@ parallel_curl_download() {
     fi
 
     local total_mb=$(( content_length / 1048576 ))
-    log_info "安装包总体积: ${total_mb} MB，已开启 16 线程并发分片传输..."
+    log_info "安装包总体积: ${total_mb} MB，已启动 16 线程并发分片传输..."
 
     local chunk_size=$(( content_length / num_threads ))
     local pids=()
@@ -285,7 +285,6 @@ parallel_curl_download() {
             percent=$(( current_bytes * 100 / content_length ))
         fi
 
-        # 进度条渲染
         local num_hashes=$(( percent / 4 ))
         local hash_str=""
         for ((h=0; h<num_hashes; h++)); do hash_str="${hash_str}#"; done
@@ -309,7 +308,6 @@ parallel_curl_download() {
         fi
     done
 
-    # 校验所有线程退出状态
     local failed=0
     for pid in "${pids[@]}"; do
         wait "$pid" || failed=1
@@ -335,7 +333,10 @@ else
         rm -f "${TAR_FILE}"
     fi
 
+    # 阿里云内网 VPC 镜像 + 阿里云公网镜像优先列表
     OFFICIAL_URLS=(
+        "http://mirrors.cloud.aliyuncs.com/mysql/MySQL-8.0/${TAR_FILE}"
+        "https://mirrors.aliyun.com/mysql/MySQL-8.0/${TAR_FILE}"
         "https://cdn.mysql.com/Downloads/MySQL-8.0/${TAR_FILE}"
         "https://dev.mysql.com/get/Downloads/MySQL-8.0/${TAR_FILE}"
         "https://downloads.mysql.com/archives/get/p/23/file/${TAR_FILE}"
