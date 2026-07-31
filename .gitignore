@@ -1,0 +1,12 @@
+# Temporary files
+*.log
+*.tmp
+/tmp/
+
+# Downloaded binaries
+*.tar.xz
+*.tar.gz
+
+# System files
+.DS_Store
+Thumbs.db
