@@ -1,17 +1,19 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (整合 Ubuntu24 libaio1t64 与全平台完整兼容版)
-# 1. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
-# 2. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
-# 3. 【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立：
+# MySQL 8.0.46 生产级自动化部署脚本 (初始化 --console 探针与空日志破解版)
+# 1. 【初始化探针】增加 --console 参数，强制 mysqld --initialize 将临时密码与报错推送到 stderr
+# 2. 【双重日志扫描】同时扫描 /tmp/mysql_init.log 与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
+# 3. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
+# 4. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
+# 5. 【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立：
 #    - ln -s libaio.so.1t64.0.2 /usr/lib/x86_64-linux-gnu/libaio.so.1
 #    - ln -s libncurses.so.6.4 /usr/lib/x86_64-linux-gnu/libncurses.so.6
-# 4. 【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
-# 5. 【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
-# 6. 【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
-# 7. 【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
-# 8. 【配置调优】修复 default_storage_engine，自动匹配物理内存分配 InnoDB Buffer Pool
-# 9. 【安全隔离】自动生成 12 位随机高强度密码，开启 root@% 远程访问 (mysql_native_password)
+# 6. 【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
+# 7. 【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
+# 8. 【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
+# 9. 【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
+# 10.【配置调优】修复 default_storage_engine，自动匹配物理内存分配 InnoDB Buffer Pool
+# 11.【安全隔离】自动生成 12 位随机高强度密码，开启 root@% 远程访问 (mysql_native_password)
 # ==============================================================================
 
 set -eo pipefail
@@ -141,7 +143,7 @@ log_info "系统 glibc 版本: ${GLIBC_VER}"
 GLIBC_TAG=""
 if version_ge "$GLIBC_VER" "2.28"; then
     GLIBC_TAG="glibc2.28"
-elif version_ge "$GLIBC_TAG" "2.17"; then
+elif version_ge "$GLIBC_VER" "2.17"; then
     GLIBC_TAG="glibc2.17"
 else
     log_err "系统 glibc 版本 (${GLIBC_VER}) 低于 2.17，MySQL 8.0.46 官方二进制包不支持该系统！"
@@ -200,10 +202,8 @@ EOF
         local pkg_mgr=$(command -v dnf || command -v yum)
         log_info "检测到 RedHat/CentOS/Rocky 系统，执行 libaio, perl, perl-devel 与 EPEL 安装..."
         
-        # 1. 对应图片：RedHat 系统 (如 CentOS)
         $pkg_mgr -y install libaio perl perl-devel || true
         
-        # 2. 补全其他扩展依赖包
         $pkg_mgr install -y wget || true
         $pkg_mgr install -y tar || true
         $pkg_mgr install -y xz || true
@@ -220,14 +220,11 @@ EOF
         log_info "检测到 Debian/Ubuntu 系统，执行常规版 libaio1 与 Ubuntu24 特殊包安装..."
         apt-get update -y || true
 
-        # 3. 对应图片：Debian/Ubuntu 常规版
         apt-get install -y libaio1 || true
         apt-get install -y libaio-dev || true
 
-        # 4. 对应图片：Ubuntu 24LTS / 22LTS 专属解法
         apt install -y numactl libaio1t64 || true
 
-        # 补全其他基础依赖
         apt-get install -y wget || true
         apt-get install -y tar || true
         apt-get install -y xz-utils || true
@@ -241,7 +238,6 @@ EOF
 
     log_info "自动建立针对 Ubuntu 24 及通用系统的 libaio.so.1 & libncurses.so.6 软链接..."
 
-    # 5. 对应图片：Ubuntu 专属软链接设置 (支持 x86_64 与 aarch64)
     local target_arch_dir=""
     case "${ARCH}" in
         x86_64|amd64) target_arch_dir="/usr/lib/x86_64-linux-gnu" ;;
@@ -251,14 +247,12 @@ EOF
     if [ -n "${target_arch_dir}" ] && [ -d "${target_arch_dir}" ]; then
         cd "${target_arch_dir}"
         
-        # ln -s libaio.so.1t64.0.2 libaio.so.1
         local t64_lib=$(find "${target_arch_dir}" -name "libaio.so.1t64*" 2>/dev/null | head -n 1 || true)
         if [ -n "${t64_lib}" ]; then
             ln -sf "${t64_lib}" libaio.so.1 2>/dev/null || true
             log_info "Ubuntu 24 特性处理完成: ${t64_lib} -> ${target_arch_dir}/libaio.so.1"
         fi
 
-        # ln -s libncurses.so.6.4 libncurses.so.6
         local nc6_lib=$(find "${target_arch_dir}" -name "libncurses.so.6*" 2>/dev/null | head -n 1 || true)
         if [ -n "${nc6_lib}" ]; then
             ln -sf "${nc6_lib}" libncurses.so.6 2>/dev/null || true
@@ -267,7 +261,6 @@ EOF
         fi
     fi
 
-    # 6. 全全局通用 libaio.so.1 补全 (覆盖所有 Linux 架构与目录)
     local aio_target=""
     aio_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -name "libaio.so*" 2>/dev/null | head -n 1 || true)
 
@@ -280,7 +273,6 @@ EOF
         if [ -d "/usr/lib/aarch64-linux-gnu" ]; then ln -sf "$aio_target" /usr/lib/aarch64-linux-gnu/libaio.so.1 2>/dev/null || true; fi
     fi
 
-    # 7. 全局通用 libssl.so.1.1 补全
     local ssl_target=""
     ssl_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -name "libssl.so.1.1*" 2>/dev/null | head -n 1 || true)
     if [ -n "$ssl_target" ]; then
@@ -666,7 +658,7 @@ EOF
 log_info "配置文件 /etc/my.cnf 生成成功！"
 
 # ------------------------------------------------------------------------------
-# 9. 初始化数据库 (带 --lower-case-table-names=1)
+# 9. 初始化数据库 (带 --lower-case-table-names=1 与 --console 探针)
 # ------------------------------------------------------------------------------
 log_step "Step 7: 初始化数据库"
 
@@ -677,19 +669,26 @@ set +e
 "${INSTALL_DIR}/bin/mysqld" \
     --defaults-file=/etc/my.cnf \
     --initialize \
+    --console \
     --lower-case-table-names=1 \
     --user=${MYSQL_USER} > "${INIT_LOG}" 2>&1
 INIT_RET=$?
 set -e
 
-TEMP_PASSWORD=$(grep "A temporary password" "${INIT_LOG}" 2>/dev/null | awk '{print $NF}' || true)
+TEMP_PASSWORD=$(grep "A temporary password" "${INIT_LOG}" "${LOG_DIR}/mysql.log" 2>/dev/null | awk '{print $NF}' | tail -n 1 || true)
 
 if [ -n "${TEMP_PASSWORD}" ] && [ $INIT_RET -eq 0 ]; then
     log_info "数据库初始化成功！"
 else
-    log_err "数据库初始化失败！详情见以下日志输出 (${INIT_LOG}):"
+    log_err "数据库初始化失败！详情见以下日志输出:"
     echo "--------------------------------------------------------------------------"
-    cat "${INIT_LOG}" 2>/dev/null || true
+    if [ -s "${INIT_LOG}" ]; then
+        cat "${INIT_LOG}"
+    elif [ -s "${LOG_DIR}/mysql.log" ]; then
+        cat "${LOG_DIR}/mysql.log"
+    else
+        echo "未能在控制台或 ${LOG_DIR}/mysql.log 中捕获到初始化错误信息。"
+    fi
     echo "--------------------------------------------------------------------------"
     exit 1
 fi
