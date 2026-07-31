@@ -1,15 +1,17 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (终极全向 Bug 修复与工业级安全加固版)
-# 1. 【原子依赖与软链接】拆分 Yum/Apt 原子安装，自动补全 libaio.so.1 / libssl.so.1.1 软链接
-# 2. 【信号捕获与垃圾清理】配置 trap 捕获 INT/TERM/EXIT 信号，退出或中断时全自动清理临时分块
-# 3. 【Socket 就绪轮询】服务启动后自动进行 Socket/Ping 探测就绪循环，彻底解决密码修改时 Socket 未就绪问题
-# 4. 【防火墙与 SELinux】自动识别 firewalld / ufw / SELinux 状态，全自动放行配置端口与规则
-# 5. 【系统资源 Limit 调优】自动调优 /etc/security/limits.conf 与 sysctl.conf max_open_files 限制
-# 6. 【高兼容认证】显式指定 IDENTIFIED WITH mysql_native_password，全面兼容各类新旧客户端工具
+# MySQL 8.0.46 生产级自动化部署脚本 (整合 Ubuntu24 libaio1t64 与全平台完整兼容版)
+# 1. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
+# 2. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
+# 3. 【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立：
+#    - ln -s libaio.so.1t64.0.2 /usr/lib/x86_64-linux-gnu/libaio.so.1
+#    - ln -s libncurses.so.6.4 /usr/lib/x86_64-linux-gnu/libncurses.so.6
+# 4. 【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
+# 5. 【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
+# 6. 【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
 # 7. 【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
 # 8. 【配置调优】修复 default_storage_engine，自动匹配物理内存分配 InnoDB Buffer Pool
-# 9. 【安全隔离】自动生成 12 位随机高强度密码，开启 root@% 远程访问
+# 9. 【安全隔离】自动生成 12 位随机高强度密码，开启 root@% 远程访问 (mysql_native_password)
 # ==============================================================================
 
 set -eo pipefail
@@ -139,7 +141,7 @@ log_info "系统 glibc 版本: ${GLIBC_VER}"
 GLIBC_TAG=""
 if version_ge "$GLIBC_VER" "2.28"; then
     GLIBC_TAG="glibc2.28"
-elif version_ge "$GLIBC_VER" "2.17"; then
+elif version_ge "$GLIBC_TAG" "2.17"; then
     GLIBC_TAG="glibc2.17"
 else
     log_err "系统 glibc 版本 (${GLIBC_VER}) 低于 2.17，MySQL 8.0.46 官方二进制包不支持该系统！"
@@ -177,12 +179,12 @@ log_info "系统总物理内存: ${TOTAL_MEM_MB} MB"
 log_info "自动匹配 InnoDB Buffer Pool: ${BUFFER_POOL_SIZE} (Instances: ${BUFFER_POOL_INSTANCES})"
 
 # ------------------------------------------------------------------------------
-# 5. 安装基础依赖、调整 limit 系统限制与 libaio/openssl 专项补全
+# 5. 安装基础依赖（融入 RedHat/Debian/Ubuntu24 特殊解法）
 # ------------------------------------------------------------------------------
-log_step "Step 3: 安装基础依赖软件包、提升 Limit 限制与动态建链"
+log_step "Step 3: 安装基础依赖与全平台 libaio 库支持"
 
 install_dependencies() {
-    # 调整系统打开文件数 limits.conf
+    # 调整系统 limits.conf
     if [ -f /etc/security/limits.conf ]; then
         if ! grep -q "mysql soft nofile" /etc/security/limits.conf; then
             cat >> /etc/security/limits.conf <<EOF
@@ -196,12 +198,15 @@ EOF
 
     if command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then
         local pkg_mgr=$(command -v dnf || command -v yum)
-        log_info "检测到 RHEL/CentOS/Rocky 系统，逐个原子安装核心依赖..."
+        log_info "检测到 RedHat/CentOS/Rocky 系统，执行 libaio, perl, perl-devel 与 EPEL 安装..."
         
+        # 1. 对应图片：RedHat 系统 (如 CentOS)
+        $pkg_mgr -y install libaio perl perl-devel || true
+        
+        # 2. 补全其他扩展依赖包
         $pkg_mgr install -y wget || true
         $pkg_mgr install -y tar || true
         $pkg_mgr install -y xz || true
-        $pkg_mgr install -y libaio || true
         $pkg_mgr install -y libaio-devel || true
         $pkg_mgr install -y numactl || true
         $pkg_mgr install -y numactl-libs || true
@@ -211,47 +216,79 @@ EOF
         $pkg_mgr install -y ncurses-compat-libs || true
         $pkg_mgr install -y ncurses-libs || true
 
-    elif command -v apt-get >/dev/null 2>&1; then
-        log_info "检测到 Debian/Ubuntu 系统，逐个原子安装核心依赖..."
+    elif command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+        log_info "检测到 Debian/Ubuntu 系统，执行常规版 libaio1 与 Ubuntu24 特殊包安装..."
         apt-get update -y || true
+
+        # 3. 对应图片：Debian/Ubuntu 常规版
+        apt-get install -y libaio1 || true
+        apt-get install -y libaio-dev || true
+
+        # 4. 对应图片：Ubuntu 24LTS / 22LTS 专属解法
+        apt install -y numactl libaio1t64 || true
+
+        # 补全其他基础依赖
         apt-get install -y wget || true
         apt-get install -y tar || true
         apt-get install -y xz-utils || true
-        apt-get install -y libaio1 || true
-        apt-get install -y libaio-dev || true
-        apt-get install -y libaio1t64 || true
-        apt-get install -y numactl || true
         apt-get install -y libnuma1 || true
         apt-get install -y libssl-dev || true
         apt-get install -y openssl || true
         apt-get install -y libncurses5 || true
+        apt-get install -y libncurses6 || true
         apt-get install -y libncursesw5 || true
     fi
 
-    # 动态扫描系统已有的 libaio 文件并强制补全全路径软链接
-    log_info "全局扫描系统 libaio 共享库并自动建链..."
+    log_info "自动建立针对 Ubuntu 24 及通用系统的 libaio.so.1 & libncurses.so.6 软链接..."
+
+    # 5. 对应图片：Ubuntu 专属软链接设置 (支持 x86_64 与 aarch64)
+    local target_arch_dir=""
+    case "${ARCH}" in
+        x86_64|amd64) target_arch_dir="/usr/lib/x86_64-linux-gnu" ;;
+        aarch64|arm64) target_arch_dir="/usr/lib/aarch64-linux-gnu" ;;
+    esac
+
+    if [ -n "${target_arch_dir}" ] && [ -d "${target_arch_dir}" ]; then
+        cd "${target_arch_dir}"
+        
+        # ln -s libaio.so.1t64.0.2 libaio.so.1
+        local t64_lib=$(find "${target_arch_dir}" -name "libaio.so.1t64*" 2>/dev/null | head -n 1 || true)
+        if [ -n "${t64_lib}" ]; then
+            ln -sf "${t64_lib}" libaio.so.1 2>/dev/null || true
+            log_info "Ubuntu 24 特性处理完成: ${t64_lib} -> ${target_arch_dir}/libaio.so.1"
+        fi
+
+        # ln -s libncurses.so.6.4 libncurses.so.6
+        local nc6_lib=$(find "${target_arch_dir}" -name "libncurses.so.6*" 2>/dev/null | head -n 1 || true)
+        if [ -n "${nc6_lib}" ]; then
+            ln -sf "${nc6_lib}" libncurses.so.6 2>/dev/null || true
+            ln -sf "${nc6_lib}" libncurses.so.5 2>/dev/null || true
+            log_info "Ubuntu 24 特性处理完成: ${nc6_lib} -> ${target_arch_dir}/libncurses.so.6"
+        fi
+    fi
+
+    # 6. 全全局通用 libaio.so.1 补全 (覆盖所有 Linux 架构与目录)
     local aio_target=""
-    aio_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libaio.so*" 2>/dev/null | head -n 1 || true)
+    aio_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -name "libaio.so*" 2>/dev/null | head -n 1 || true)
 
     if [ -n "$aio_target" ]; then
-        log_info "系统已找到 libaio 共享库: ${aio_target}，自动创建全局链接..."
         ln -sf "$aio_target" /usr/lib64/libaio.so.1 2>/dev/null || true
         ln -sf "$aio_target" /lib64/libaio.so.1 2>/dev/null || true
         ln -sf "$aio_target" /usr/lib/libaio.so.1 2>/dev/null || true
         ln -sf "$aio_target" /lib/libaio.so.1 2>/dev/null || true
-        ln -sf "$aio_target" /usr/lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true
-        ln -sf "$aio_target" /lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true
+        if [ -d "/usr/lib/x86_64-linux-gnu" ]; then ln -sf "$aio_target" /usr/lib/x86_64-linux-gnu/libaio.so.1 2>/dev/null || true; fi
+        if [ -d "/usr/lib/aarch64-linux-gnu" ]; then ln -sf "$aio_target" /usr/lib/aarch64-linux-gnu/libaio.so.1 2>/dev/null || true; fi
     fi
 
-    # 动态扫描系统已有的 libssl.so.1.1 文件并建链
+    # 7. 全局通用 libssl.so.1.1 补全
     local ssl_target=""
-    ssl_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libssl.so.1.1*" 2>/dev/null | head -n 1 || true)
+    ssl_target=$(find /lib64 /usr/lib64 /lib /usr/lib /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib/aarch64-linux-gnu /usr/lib/aarch64-linux-gnu -name "libssl.so.1.1*" 2>/dev/null | head -n 1 || true)
     if [ -n "$ssl_target" ]; then
         ln -sf "$ssl_target" /usr/lib64/libssl.so.1.1 2>/dev/null || true
         ln -sf "$ssl_target" /lib64/libssl.so.1.1 2>/dev/null || true
         ln -sf "$ssl_target" /usr/lib/libssl.so.1.1 2>/dev/null || true
         ln -sf "$ssl_target" /lib/libssl.so.1.1 2>/dev/null || true
-        ln -sf "$ssl_target" /usr/lib/x86_64-linux-gnu/libssl.so.1.1 2>/dev/null || true
+        if [ -d "/usr/lib/x86_64-linux-gnu" ]; then ln -sf "$ssl_target" /usr/lib/x86_64-linux-gnu/libssl.so.1.1 2>/dev/null || true; fi
     fi
 
     ldconfig >/dev/null 2>&1 || true
