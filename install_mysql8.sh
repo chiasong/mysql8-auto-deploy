@@ -1,9 +1,9 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (实测 200 OK 源 + 16 线程分片加速版)
-# 1. 彻底剔除 USTC 403 防盗链节点与阿里云 404 缺失节点，仅保留官方 100% 可用的 CDN 源
-# 2. 将 SSL 握手超时提升至 15 秒，彻底解决国内访问海外 CDN 预检报 000000 超时误判的问题
-# 3. 采用 16 线程并发 Curl Range 分片技术与实时网速/进度条显示
+# MySQL 8.0.46 生产级自动化部署脚本 (8 线程黄金并发+伪装 User-Agent 防限速版)
+# 1. 将并发线程优化为 8 线程（TCP 传输黄金平衡点），避免触发 CDN 反刷限流阀值
+# 2. 增加标准 User-Agent 标头伪装，防止 CDN 对裸 curl/脚本连接进行 QoS 压制
+# 3. 将 SSL 握手超时提升至 15 秒，保障国内服务器与官方 CDN 建立稳定连接
 # 4. 具备全自动完整性校验（xz -t / 大小校验），上次中断损坏的文件自动清除重下
 # 5. 支持交互输入部署主路径（默认 /data/mysql8），数据/日志合理存放在子目录
 # 6. 支持交互输入服务端口（默认 3306），具备端口占用实时检测提醒
@@ -194,13 +194,15 @@ if ! getent passwd "${MYSQL_USER}" >/dev/null 2>&1; then
 fi
 
 # ------------------------------------------------------------------------------
-# 7. 官方 CDN 16 线程 Curl Range 并发分片极速下载
+# 7. 8 线程黄金并发 Curl Range 分片极速下载 (伪装 User-Agent)
 # ------------------------------------------------------------------------------
-log_step "Step 5: 16 线程极速并发分片下载"
+log_step "Step 5: 8 线程黄金并发分片下载"
 
 TMP_DOWNLOAD_DIR="/tmp/mysql_install_pkg"
 mkdir -p "${TMP_DOWNLOAD_DIR}"
 cd "${TMP_DOWNLOAD_DIR}"
+
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # 完整性校验函数：检查文件是否存在、大小是否大于50MB且 xz 校验流是否完整
 check_package_integrity() {
@@ -220,20 +222,20 @@ check_package_integrity() {
     return 0
 }
 
-# 16 并发 Curl Range 分段下载 + 实时网速显示函数
+# 8 并发 Curl Range 分段下载 + 实时网速显示函数
 parallel_curl_download() {
     local url="$1"
     local output="$2"
-    local num_threads=16
+    local num_threads=8
 
     log_info "连接官方 CDN 下载节点: ${url}"
 
     # 使用 15 秒连接超时，保障国内服务器与海外 CDN 建立 SSL 握手
-    local content_length=$(curl -sI -L --connect-timeout 15 "${url}" | grep -i "^content-length:" | awk '{print $2}' | tr -d '\r\n' | grep -E '^[0-9]+$' | grep -v '^0$' | tail -n1 || true)
+    local content_length=$(curl -sI -L -A "${UA}" --connect-timeout 15 "${url}" | grep -i "^content-length:" | awk '{print $2}' | tr -d '\r\n' | grep -E '^[0-9]+$' | grep -v '^0$' | tail -n1 || true)
 
     if [ -z "$content_length" ] || [ "$content_length" -lt 52428800 ]; then
         log_warn "获取 Content-Length 异常，尝试 Range 探测..."
-        local range_header=$(curl -sI -L --connect-timeout 15 -r 0-10 "${url}" | grep -i "^content-range:" | tail -n1 || true)
+        local range_header=$(curl -sI -L -A "${UA}" --connect-timeout 15 -r 0-10 "${url}" | grep -i "^content-range:" | tail -n1 || true)
         if [ -n "$range_header" ]; then
             content_length=$(echo "$range_header" | awk -F'/' '{print $2}' | tr -d '\r\n' | grep -E '^[0-9]+$' || true)
         fi
@@ -245,7 +247,7 @@ parallel_curl_download() {
     fi
 
     local total_mb=$(( content_length / 1048576 ))
-    log_info "获取文件成功！总大小: ${total_mb} MB，已开启 16 线程并发分片传输..."
+    log_info "获取文件成功！总大小: ${total_mb} MB，已开启 8 线程并发分片传输..."
 
     local chunk_size=$(( content_length / num_threads ))
     local pids=()
@@ -262,7 +264,7 @@ parallel_curl_download() {
         
         local chunk_file="${chunk_dir}/chunk_$(printf "%02d" $i)"
         (
-            curl -s -L --retry 5 --retry-delay 2 -r "${start}-${end}" "${url}" -o "${chunk_file}"
+            curl -s -L -A "${UA}" --retry 5 --retry-delay 2 -r "${start}-${end}" "${url}" -o "${chunk_file}"
         ) &
         pids+=($!)
     done
@@ -325,7 +327,7 @@ parallel_curl_download() {
     done
 
     if [ $failed -eq 0 ]; then
-        log_info "16 分块并发传输完成，合并整合成最终安装包..."
+        log_info "8 分块并发传输完成，合并整合成最终安装包..."
         cat "${chunk_dir}"/chunk_* > "${output}"
         rm -rf "${chunk_dir}"
         return 0
@@ -352,11 +354,11 @@ else
 
     DOWNLOAD_SUCCESS=0
 
-    # 优先执行内建 16 线程 Curl 分块并发传输
+    # 优先执行内建 8 线程 Curl 分块并发传输
     for URL in "${OFFICIAL_URLS[@]}"; do
         if parallel_curl_download "${URL}" "${TAR_FILE}"; then
             if check_package_integrity "${TAR_FILE}"; then
-                log_info "恭喜！使用 16 并发分块传输成功完成极速下载，并通过完整性校验！"
+                log_info "恭喜！使用 8 并发分块传输成功完成极速下载，并通过完整性校验！"
                 DOWNLOAD_SUCCESS=1
                 break
             fi
