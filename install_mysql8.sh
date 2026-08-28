@@ -1,21 +1,21 @@
 #!/bin/bash
 # ==============================================================================
-# MySQL 8.0.46 生产级自动化部署脚本 (Step9 set+e 密码修改安全隔离版)
-# 1. 【密码修改安全隔离】Step 9 使用 set +e 包裹 mysql 执行块，防止非零退出码触发 set -e 导致脚本提前中断
-# 2. 【错误捕获强化】密码更新失败时全自动打印 /tmp/mysql_pass_update.log 详细 SQL 报错
-# 3. 【软链接防死循环】设计安全建链函数 safe_symlink，彻底根治 libaio.so.1 -> libaio.so.1 循环指向 Bug
-# 4. 【实体文件过滤】find 命令强制使用 -type f -name "libaio.so*" ! -name "libaio.so.1" 仅匹配真实文件
-# 5. 【初始化探针】增加 --console 参数，强制 mysqld --initialize 将临时密码与报错推送到 stderr
-# 6. 【双重日志扫描】同时扫描 /tmp/mysql_init.log 与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
-# 7. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
-# 8. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
-# 9. 【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立：
-#    - ln -s libaio.so.1t64.0.2 /usr/lib/x86_64-linux-gnu/libaio.so.1
-#    - ln -s libncurses.so.6.4 /usr/lib/x86_64-linux-gnu/libncurses.so.6
-# 10.【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
-# 11.【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
-# 12.【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
-# 13.【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
+# MySQL 8.0.46 生产级自动化部署脚本 (解决 Row size too large 8126 终极配置加固版)
+# 1. 【Row Size 太大问题修复】配置 innodb_strict_mode = 0 与 innodb_default_row_format = DYNAMIC，
+#    彻底解决应用系统报错 Row size too large (> 8126) 的问题
+# 2. 【密码修改安全隔离】Step 9 使用 set +e 包裹 mysql 执行块，防止非零退出码触发 set -e 导致脚本提前中断
+# 3. 【错误捕获强化】密码更新失败时全自动打印 /tmp/mysql_pass_update.log 详细 SQL 报错
+# 4. 【软链接防死循环】设计安全建链函数 safe_symlink，彻底根治 libaio.so.1 -> libaio.so.1 循环指向 Bug
+# 5. 【实体文件过滤】find 命令强制使用 -type f -name "libaio.so*" ! -name "libaio.so.1" 仅匹配真实文件
+# 6. 【初始化探针】增加 --console 参数，强制 mysqld --initialize 将临时密码与报错推送到 stderr
+# 7. 【双重日志扫描】同时扫描 /tmp/mysql_init.log 与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
+# 8. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
+# 9. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
+# 10.【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立相关软链接
+# 11.【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
+# 12.【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
+# 13.【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
+# 14.【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
 # ==============================================================================
 
 set -eo pipefail
@@ -623,7 +623,8 @@ innodb_file_per_table = ON
 innodb_buffer_pool_instances = ${BUFFER_POOL_INSTANCES}
 innodb_online_alter_log_max_size = 2G
 innodb_lock_wait_timeout = 50
-innodb_strict_mode = 1
+innodb_strict_mode = 0
+innodb_default_row_format = DYNAMIC
 transaction_isolation = READ-COMMITTED
 innodb_autoinc_lock_mode = 2
 innodb_flush_neighbors = 0
