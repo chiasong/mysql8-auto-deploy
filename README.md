@@ -11,11 +11,12 @@
 ## 🌟 核心特性
 
 - 🧠 **glibc 与架构智能匹配**：自动检测系统 `glibc` 版本（区分 `glibc2.17` / `glibc2.28`）及 CPU 架构（`x86_64` / `aarch64`），拉取官方匹配包。
-- ⚡ **一键极速部署**：从依赖安装、用户创建、二进制解压、配置文件生成到 Systemd 服务注册全自动化完成。
+- ⚡ **原生极速分片下载**：内置 8 线程 Curl 原生并发分片传输与 HTTP 206 握手校验，支持单分片局部重试，采用“边拼边删”流式合并，大幅节省临时磁盘开销。
+- 🎯 **生产 / 测试双环境适配**：支持“生产高性能模式”（全量缓存与监控）与“测试/轻量节能模式”（常驻内存仅 ~200MB，关闭 Performance Schema，精简会话缓存，防测试机 OOM）。
 - ⚙️ **交互式路径与端口配置**：支持自定义部署主目录与服务端口，内置端口占用实时检测与二次提醒。
-- 💾 **InnoDB 内存智能适配**：依据系统总物理内存，动态计算分配最优的 `innodb_buffer_pool_size` 与 `instances`。
-- 🔒 **高安全性**：命令行自动生成 12 位随机高强度密码，自动配置 `root@%` 远程访问权限。
-- 🛠️ **生产级 my.cnf 优化**：统一 `utf8mb4` 字符集，修正 MySQL 8.0 `lower_case_table_names=1` 初始化陷阱，优化会话缓存防 OOM。
+- 💾 **InnoDB 内存智能适配**：依据所选部署模式与系统总物理内存，动态计算分配最优的 `innodb_buffer_pool_size` 与参数组合。
+- 🔒 **高安全性与防误删**：数据目录非空覆盖安全确认，敏感日志权限严格隔离（`chmod 600`），自动生成 12 位高强度随机密码并授权 `root@%` 远程访问。
+- 🛠️ **生产级 my.cnf 优化**：统一 `utf8mb4` 字符集，修正 MySQL 8.0 `lower_case_table_names=1` 初始化陷阱，配置 `innodb_strict_mode=0` 彻底解决 Row size too large 问题。
 
 ---
 
@@ -56,20 +57,27 @@ mysql8-auto-deploy/
    - 程序目录：`/data/mysql8`
    - 数据目录：`/data/mysql8/datas`
    - 日志目录：`/data/mysql8/logs`
-2. **选择服务端口**（默认 `3306`）：自动校验 1-65535 端口有效性及是否被占用。
-3. **自动化部署**：自动下载官方包、配置 `/etc/my.cnf`、初始化数据库、启动服务并生成 12 位 root 随机密码。
+2. **选择部署运行模式**（默认 `1` 生产模式）：
+   - `1) 生产高性能模式`：充分利用硬件资源，内存按 50%~60% 分配，启用 Performance Schema，最大 2000 连接。
+   - `2) 测试/轻量节能模式`：关闭 Performance Schema，内存占用仅约 200MB，适合测试机、开发混跑机与低配 VPS。
+3. **选择服务端口**（默认 `3306`）：自动校验 1-65535 端口有效性及是否被占用。
+4. **自动化部署**：自动执行 8 线程并发分片下载、配置 `/etc/my.cnf`、初始化数据库、启动服务并生成 12 位 root 随机密码。
 
 ---
 
-## 📄 my.cnf 关键配置参数
+## 📄 运行模式与 my.cnf 关键参数对比
 
-| 配置项 | 预设值 | 说明 |
-| :--- | :--- | :--- |
-| `character-set-server` | `utf8mb4` | 完整的 UTF-8 字符集支持（含 Emoji） |
-| `lower_case_table_names` | `1` | 表名不区分大小写（已做 `--initialize` 兼容） |
-| `innodb_buffer_pool_size` | 动态分配 | 自动按系统物理内存 50%~60% 计算分配 |
-| `innodb_redo_log_capacity`| `2G` | MySQL 8.0.30+ 官方推荐的动态 Redo Log 配置 |
-| `sort_buffer_size` | `2M` | 安全的会话级排序缓存，防止高并发下 OOM |
+| 配置项 | 生产高性能模式 | 测试/轻量节能模式 | 说明 |
+| :--- | :--- | :--- | :--- |
+| **`performance_schema`** | `ON` | `OFF` | 测试模式关闭可立省 250MB~400MB 物理常驻内存 |
+| **`innodb_buffer_pool_size`**| 物理内存 50%~60% | `256M` ~ `512M` | 测试模式轻量分配，防与其他微服务争抢内存 |
+| **`max_connections`** | `2000` | `150` | 精简连接池数量，降低底层连接结构体开销 |
+| **`binlog_cache_size`** | `32M` | `1M` | 规避每个事务连接预分配大内存触发 OOM |
+| **`sort / join_buffer_size`**| `2M` | `512K` | 调优会话排序及关联缓冲区 |
+| **`tmp_table_size`** | `256M` | `32M` | 内存内部临时表尺寸限制 |
+| **`character-set-server`** | `utf8mb4` | `utf8mb4` | 完整的 UTF-8 字符集支持（含 Emoji） |
+| **`lower_case_table_names`**| `1` | `1` | 表名不区分大小写（已做 `--initialize` 兼容） |
+| **`innodb_strict_mode`** | `0` | `0` | 解决大字段报错 `Row size too large (> 8126)` |
 
 ---
 

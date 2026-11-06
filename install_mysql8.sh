@@ -4,18 +4,19 @@
 # 1. 【Row Size 太大问题修复】配置 innodb_strict_mode = 0 与 innodb_default_row_format = DYNAMIC，
 #    彻底解决应用系统报错 Row size too large (> 8126) 的问题
 # 2. 【密码修改安全隔离】Step 9 使用 set +e 包裹 mysql 执行块，防止非零退出码触发 set -e 导致脚本提前中断
-# 3. 【错误捕获强化】密码更新失败时全自动打印 /tmp/mysql_pass_update.log 详细 SQL 报错
+# 3. 【错误捕获强化】密码更新失败时全自动打印详细 SQL 报错
 # 4. 【软链接防死循环】设计安全建链函数 safe_symlink，彻底根治 libaio.so.1 -> libaio.so.1 循环指向 Bug
 # 5. 【实体文件过滤】find 命令强制使用 -type f -name "libaio.so*" ! -name "libaio.so.1" 仅匹配真实文件
 # 6. 【初始化探针】增加 --console 参数，强制 mysqld --initialize 将临时密码与报错推送到 stderr
-# 7. 【双重日志扫描】同时扫描 /tmp/mysql_init.log 与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
+# 7. 【双重日志扫描】同时扫描初始化日志与 ${LOG_DIR}/mysql.log，彻底解决日志空输出问题
 # 8. 【RedHat/CentOS】完美融入 yum -y install libaio perl perl-devel
 # 9. 【Debian/Ubuntu 常规版】完美融入 apt-get install -y libaio1
 # 10.【Ubuntu 24LTS/22LTS 专治版】融入 apt install numactl libaio1t64 -y 并自动建立相关软链接
-# 11.【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块
+# 11.【信号捕获与垃圾清理】捕获 INT/TERM/EXIT 信号，退出或中断全自动清理临时分块与后台下载子进程
 # 12.【Socket 就绪轮询】动态 Socket/Ping 探测轮询循环，彻底解决密码修改时 Socket 未就绪问题
 # 13.【防火墙与 SELinux】自动识别 firewalld / ufw 状态，全自动放行配置端口
-# 14.【网络加速】8 线程黄金并发 + Chrome User-Agent 标头伪装 + 15 秒 SSL 握手容限
+# 14.【高可靠原生分片下载】8 线程 HTTP 206 校验 + 单分片独立重试 + 边拼边删流式释放空间 + 孤儿进程治理
+# 15.【全链路安全加固】数据目录非空覆盖交互确认 + 密码日志权限收紧 (chmod 600) + 部署完成清理暂存包
 # ==============================================================================
 
 set -eo pipefail
@@ -33,19 +34,49 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+PARALLEL_PIDS=()
+DOWNLOAD_CHUNK_DIR=""
+TMP_DOWNLOAD_DIR=""
+INIT_LOG=""
+PASS_UPDATE_LOG=""
+
 log_info() { echo -e "${GREEN}[INFO] $1${NC}"; }
 log_warn() { echo -e "${YELLOW}[WARN] $1${NC}"; }
 log_err()  { echo -e "${RED}[ERROR] $1${NC}"; }
 log_step() { echo -e "\n${BLUE}========== $1 ==========${NC}"; }
 
-# 捕获脚本中断与退出信号，全自动清理临时垃圾
+# 捕获脚本中断与退出信号，全自动清理临时垃圾与后台孤儿进程
 cleanup_on_exit() {
     local exit_code=$?
+
+    # 1. 终止可能仍在后台运行的并发下载子进程，防止孤儿进程持续占用网络带宽
+    if [ ${#PARALLEL_PIDS[@]} -gt 0 ]; then
+        for pid in "${PARALLEL_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null || true
+            fi
+        done
+        wait 2>/dev/null || true
+    fi
+
+    # 2. 清理分块临时目录
+    if [ -n "${DOWNLOAD_CHUNK_DIR}" ] && [ -d "${DOWNLOAD_CHUNK_DIR}" ]; then
+        rm -rf "${DOWNLOAD_CHUNK_DIR}" 2>/dev/null || true
+    fi
     if [ -d "/tmp/mysql_chunks_$$" ]; then
         rm -rf "/tmp/mysql_chunks_$$" 2>/dev/null || true
     fi
+
+    # 3. 清理包含敏感密码的临时日志
+    if [ -n "${INIT_LOG}" ] && [ -f "${INIT_LOG}" ]; then
+        rm -f "${INIT_LOG}" 2>/dev/null || true
+    fi
+    if [ -n "${PASS_UPDATE_LOG}" ] && [ -f "${PASS_UPDATE_LOG}" ]; then
+        rm -f "${PASS_UPDATE_LOG}" 2>/dev/null || true
+    fi
+
     if [ $exit_code -ne 0 ]; then
-        log_warn "检测到脚本异常退出 (Code: ${exit_code})，已完成临时垃圾文件清理。"
+        log_warn "检测到脚本异常退出 (Code: ${exit_code})，已完成临时垃圾文件与后台进程清理。"
     fi
 }
 trap cleanup_on_exit EXIT INT TERM
@@ -74,6 +105,21 @@ LOG_DIR="${BASE_DIR}/logs"
 log_info "部署主路径: ${BASE_DIR}"
 log_info "数据存储目录: ${DATA_DIR}"
 log_info "日志存储目录: ${LOG_DIR}"
+
+# 选择部署环境模式
+echo ""
+log_info "请选择 MySQL 部署运行模式:"
+echo "  1) 生产高性能模式 [默认] (按内存 50%~60% 动态分配 Buffer Pool，开启 Performance Schema，大并发连接池)"
+echo "  2) 测试/轻量节能模式 (低常驻内存 ~200MB，关闭 Performance Schema，精简 Session 缓存，适合开发/测试/低配环境)"
+read -p "请输入模式序号 [1-2, 默认 1]: " INPUT_MODE
+DEPLOY_MODE="${INPUT_MODE:-1}"
+if [ "${DEPLOY_MODE}" != "2" ]; then
+    DEPLOY_MODE="1"
+    DEPLOY_MODE_NAME="生产高性能模式"
+else
+    DEPLOY_MODE_NAME="测试/轻量节能模式"
+fi
+log_info "已选定部署模式: ${DEPLOY_MODE_NAME}"
 
 # 输入端口及检测占用
 get_custom_port() {
@@ -161,26 +207,69 @@ esac
 
 TAR_FILE="mysql-${MYSQL_VERSION}-linux-${GLIBC_TAG}-${ARCH_TAG}.tar.xz"
 
-# 智能识别内存并分配 InnoDB Buffer Pool
+# 智能识别内存并按部署模式分配内存与缓存参数
 TOTAL_MEM_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 4096)
 if [ -z "$TOTAL_MEM_MB" ] || [ "$TOTAL_MEM_MB" -le 0 ]; then
     TOTAL_MEM_MB=4096
 fi
-
-if [ "$TOTAL_MEM_MB" -ge 16384 ]; then
-    BUFFER_POOL_MB=$(( TOTAL_MEM_MB * 60 / 100 ))
-    BUFFER_POOL_INSTANCES=8
-elif [ "$TOTAL_MEM_MB" -ge 4096 ]; then
-    BUFFER_POOL_MB=$(( TOTAL_MEM_MB * 50 / 100 ))
-    BUFFER_POOL_INSTANCES=4
-else
-    BUFFER_POOL_MB=1024
-    BUFFER_POOL_INSTANCES=1
-fi
-BUFFER_POOL_SIZE="${BUFFER_POOL_MB}M"
-
 log_info "系统总物理内存: ${TOTAL_MEM_MB} MB"
+
+if [ "${DEPLOY_MODE}" = "2" ]; then
+    # 测试/轻量节能模式（大幅降低常驻内存至 ~200MB，防止小内存机 OOM）
+    if [ "$TOTAL_MEM_MB" -ge 4096 ]; then
+        BUFFER_POOL_MB=512
+    else
+        BUFFER_POOL_MB=256
+    fi
+    BUFFER_POOL_SIZE="${BUFFER_POOL_MB}M"
+    BUFFER_POOL_INSTANCES=1
+    PERFORMANCE_SCHEMA="OFF"
+    MAX_CONNECTIONS=150
+    BINLOG_CACHE_SIZE="1M"
+    INNODB_LOG_BUFFER_SIZE="16M"
+    INNODB_SORT_BUFFER_SIZE="16M"
+    TMP_TABLE_SIZE="32M"
+    MAX_HEAP_TABLE_SIZE="32M"
+    SORT_BUFFER_SIZE="512K"
+    JOIN_BUFFER_SIZE="512K"
+    READ_BUFFER_SIZE="256K"
+    READ_RND_BUFFER_SIZE="512K"
+    BULK_INSERT_BUFFER_SIZE="8M"
+    TABLE_OPEN_CACHE=500
+    TABLE_DEFINITION_CACHE=400
+else
+    # 生产高性能模式（充分利用硬件内存与高并发连接池）
+    if [ "$TOTAL_MEM_MB" -ge 16384 ]; then
+        BUFFER_POOL_MB=$(( TOTAL_MEM_MB * 60 / 100 ))
+        BUFFER_POOL_INSTANCES=8
+    elif [ "$TOTAL_MEM_MB" -ge 4096 ]; then
+        BUFFER_POOL_MB=$(( TOTAL_MEM_MB * 50 / 100 ))
+        BUFFER_POOL_INSTANCES=4
+    else
+        BUFFER_POOL_MB=1024
+        BUFFER_POOL_INSTANCES=1
+    fi
+    BUFFER_POOL_SIZE="${BUFFER_POOL_MB}M"
+    PERFORMANCE_SCHEMA="ON"
+    MAX_CONNECTIONS=2000
+    BINLOG_CACHE_SIZE="32M"
+    INNODB_LOG_BUFFER_SIZE="64M"
+    INNODB_SORT_BUFFER_SIZE="64M"
+    TMP_TABLE_SIZE="256M"
+    MAX_HEAP_TABLE_SIZE="256M"
+    SORT_BUFFER_SIZE="2M"
+    JOIN_BUFFER_SIZE="2M"
+    READ_BUFFER_SIZE="2M"
+    READ_RND_BUFFER_SIZE="2M"
+    BULK_INSERT_BUFFER_SIZE="32M"
+    TABLE_OPEN_CACHE=2000
+    TABLE_DEFINITION_CACHE=1400
+fi
+
+log_info "运行模式: ${DEPLOY_MODE_NAME}"
 log_info "自动匹配 InnoDB Buffer Pool: ${BUFFER_POOL_SIZE} (Instances: ${BUFFER_POOL_INSTANCES})"
+log_info "Performance Schema 状态: ${PERFORMANCE_SCHEMA}"
+log_info "最大连接数 (max_connections): ${MAX_CONNECTIONS}"
 
 # ------------------------------------------------------------------------------
 # 5. 安全创建软链接函数 (防止指向自身导致死循环)
@@ -342,7 +431,7 @@ fi
 # ------------------------------------------------------------------------------
 log_step "Step 5: 8 线程黄金并发分片下载"
 
-TMP_DOWNLOAD_DIR="/tmp/mysql_install_pkg"
+TMP_DOWNLOAD_DIR="${BASE_DIR}/tmp_download"
 mkdir -p "${TMP_DOWNLOAD_DIR}"
 cd "${TMP_DOWNLOAD_DIR}"
 
@@ -354,7 +443,8 @@ check_package_integrity() {
     if [ ! -f "$file" ]; then
         return 1
     fi
-    local file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    local file_size
+    file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
     if [ "$file_size" -lt 52428800 ]; then
         return 1
     fi
@@ -366,50 +456,91 @@ check_package_integrity() {
     return 0
 }
 
-# 8 并发 Curl Range 分段下载 + 实时网速显示函数
+# 单分片下载与独立重试函数
+download_single_chunk() {
+    local url="$1"
+    local chunk_file="$2"
+    local start="$3"
+    local end="$4"
+    local expected_len="$5"
+    local max_retries=3
+    local retry=0
+
+    # 若已存在且尺寸完全一致，跳过无需重复下载
+    if [ -f "${chunk_file}" ]; then
+        local cur_sz
+        cur_sz=$(stat -c%s "${chunk_file}" 2>/dev/null || stat -f%z "${chunk_file}" 2>/dev/null || echo 0)
+        if [ "$cur_sz" -eq "$expected_len" ]; then
+            return 0
+        fi
+    fi
+
+    while [ $retry -lt $max_retries ]; do
+        if curl -s -L -A "${UA}" --connect-timeout 15 --retry 3 --retry-delay 2 -r "${start}-${end}" "${url}" -o "${chunk_file}"; then
+            local final_sz
+            final_sz=$(stat -c%s "${chunk_file}" 2>/dev/null || stat -f%z "${chunk_file}" 2>/dev/null || echo 0)
+            if [ "$final_sz" -eq "$expected_len" ]; then
+                return 0
+            fi
+        fi
+        retry=$(( retry + 1 ))
+        sleep 1
+    done
+    return 1
+}
+
+# 8 并发 Curl 原生 Range 分段下载 + 206 校验 + 边拼边删流式整合函数
 parallel_curl_download() {
     local url="$1"
     local output="$2"
     local num_threads=8
 
-    log_info "连接官方 CDN 下载节点: ${url}"
+    log_info "连接下载节点并探测 HTTP 206 Range 支持: ${url}"
 
-    local content_length=$(curl -sI -L -A "${UA}" --connect-timeout 15 "${url}" | grep -i "^content-length:" | awk '{print $2}' | tr -d '\r\n' | grep -E '^[0-9]+$' | grep -v '^0$' | tail -n1 || true)
+    # 1 字节探针请求，校验服务器是否真正支持 Range 并获取文件总大小
+    local probe_headers
+    probe_headers=$(curl -s -D - -L -A "${UA}" --connect-timeout 15 -r 0-0 "${url}" -o /dev/null 2>/dev/null || true)
 
-    if [ -z "$content_length" ] || [ "$content_length" -lt 52428800 ]; then
-        log_warn "获取 Content-Length 异常，尝试 Range 探测..."
-        local range_header=$(curl -sI -L -A "${UA}" --connect-timeout 15 -r 0-10 "${url}" | grep -i "^content-range:" | tail -n1 || true)
-        if [ -n "$range_header" ]; then
-            content_length=$(echo "$range_header" | awk -F'/' '{print $2}' | tr -d '\r\n' | grep -E '^[0-9]+$' || true)
-        fi
+    if ! echo "${probe_headers}" | grep -qE '^HTTP/[0-9.]+ 206'; then
+        log_warn "该节点不支持 HTTP 206 Range 分段请求，跳过分片模式并转为断点续传..."
+        return 2
+    fi
+
+    local content_length=""
+    local range_val
+    range_val=$(echo "${probe_headers}" | grep -i '^Content-Range:' | tail -n 1 || true)
+    if [ -n "${range_val}" ]; then
+        content_length=$(echo "${range_val}" | awk -F'/' '{print $2}' | tr -d '\r\n ' | grep -E '^[0-9]+$' || true)
     fi
 
     if [ -z "$content_length" ] || [ "$content_length" -lt 52428800 ]; then
-        log_warn "该节点响应超时或文件不完整，尝试下一节点..."
+        content_length=$(echo "${probe_headers}" | grep -i '^Content-Length:' | awk '{print $2}' | tr -d '\r\n ' | grep -E '^[0-9]+$' | tail -n 1 || true)
+    fi
+
+    if [ -z "$content_length" ] || [ "$content_length" -lt 52428800 ]; then
+        log_warn "获取 Content-Length 异常（未响应或文件小于 50MB），尝试下一节点..."
         return 1
     fi
 
     local total_mb=$(( content_length / 1048576 ))
-    log_info "获取文件成功！总大小: ${total_mb} MB，已开启 8 线程并发分片传输..."
+    log_info "探测成功！安装包总大小: ${total_mb} MB，已开启 ${num_threads} 线程原生并发分片传输..."
 
     local chunk_size=$(( content_length / num_threads ))
-    local pids=()
-    local chunk_dir="/tmp/mysql_chunks_$$"
-    rm -rf "${chunk_dir}"
-    mkdir -p "${chunk_dir}"
+    DOWNLOAD_CHUNK_DIR="${TMP_DOWNLOAD_DIR}/chunks_$$"
+    mkdir -p "${DOWNLOAD_CHUNK_DIR}"
 
+    PARALLEL_PIDS=()
     for ((i=0; i<num_threads; i++)); do
         local start=$(( i * chunk_size ))
         local end=$(( (i + 1) * chunk_size - 1 ))
         if [ $i -eq $(( num_threads - 1 )) ]; then
             end=$(( content_length - 1 ))
         fi
-        
-        local chunk_file="${chunk_dir}/chunk_$(printf "%02d" $i)"
-        (
-            curl -s -L -A "${UA}" --retry 5 --retry-delay 2 -r "${start}-${end}" "${url}" -o "${chunk_file}"
-        ) &
-        pids+=($!)
+        local expected_len=$(( end - start + 1 ))
+        local chunk_file="${DOWNLOAD_CHUNK_DIR}/chunk_$(printf "%02d" $i)"
+
+        download_single_chunk "${url}" "${chunk_file}" "${start}" "${end}" "${expected_len}" &
+        PARALLEL_PIDS+=($!)
     done
 
     # 动态实时进度条与实时网速刷新循环
@@ -420,9 +551,10 @@ parallel_curl_download() {
         sleep 1
         local now=$(date +%s)
         local current_bytes=0
-        for cf in "${chunk_dir}"/chunk_*; do
+        for cf in "${DOWNLOAD_CHUNK_DIR}"/chunk_*; do
             if [ -f "$cf" ]; then
-                local sz=$(stat -c%s "$cf" 2>/dev/null || stat -f%z "$cf" 2>/dev/null || echo 0)
+                local sz
+                sz=$(stat -c%s "$cf" 2>/dev/null || stat -f%z "$cf" 2>/dev/null || echo 0)
                 current_bytes=$(( current_bytes + sz ))
             fi
         done
@@ -439,20 +571,35 @@ parallel_curl_download() {
         local percent=0
         if [ "$content_length" -gt 0 ]; then
             percent=$(( current_bytes * 100 / content_length ))
+            if [ "$percent" -gt 100 ]; then percent=100; fi
+        fi
+
+        # 估算剩余时间 (ETA)
+        local eta_str="--:--"
+        if [ "$speed_bps" -gt 0 ]; then
+            local remaining_bytes=$(( content_length - current_bytes ))
+            if [ "$remaining_bytes" -gt 0 ]; then
+                local eta_secs=$(( remaining_bytes / speed_bps ))
+                local eta_min=$(( eta_secs / 60 ))
+                local eta_sec=$(( eta_secs % 60 ))
+                eta_str=$(printf "%02d:%02d" $eta_min $eta_sec)
+            else
+                eta_str="00:00"
+            fi
         fi
 
         local num_hashes=$(( percent / 4 ))
         local hash_str=""
         for ((h=0; h<num_hashes; h++)); do hash_str="${hash_str}#"; done
 
-        printf "\r${GREEN}[INFO] 下载进度: [%-25s] %3d%% (%dMB/%dMB) | 实时网速: %s MB/s${NC}" \
-            "$hash_str" "$percent" "$downloaded_mb" "$total_mb" "$speed_mbps"
+        printf "\r${GREEN}[INFO] 下载进度: [%-25s] %3d%% (%dMB/%dMB) | 实时网速: %6s MB/s | ETA: %s${NC}" \
+            "$hash_str" "$percent" "$downloaded_mb" "$total_mb" "$speed_mbps" "$eta_str"
 
         last_bytes=$current_bytes
         last_time=$now
 
         local running=0
-        for pid in "${pids[@]}"; do
+        for pid in "${PARALLEL_PIDS[@]}"; do
             if kill -0 "$pid" 2>/dev/null; then
                 running=1
                 break
@@ -464,22 +611,57 @@ parallel_curl_download() {
         fi
     done
 
+    # 等待第一轮分片任务完成
     local failed=0
-    for pid in "${pids[@]}"; do
-        wait "$pid" || failed=1
+    for pid in "${PARALLEL_PIDS[@]}"; do
+        wait "$pid" || failed=$(( failed + 1 ))
+    done
+    PARALLEL_PIDS=()
+
+    # 单分片精准二次重试回路：只对未下载完整的个别分片进行重试
+    for ((i=0; i<num_threads; i++)); do
+        local start=$(( i * chunk_size ))
+        local end=$(( (i + 1) * chunk_size - 1 ))
+        if [ $i -eq $(( num_threads - 1 )) ]; then
+            end=$(( content_length - 1 ))
+        fi
+        local expected_len=$(( end - start + 1 ))
+        local chunk_file="${DOWNLOAD_CHUNK_DIR}/chunk_$(printf "%02d" $i)"
+
+        local cur_sz
+        cur_sz=$(stat -c%s "${chunk_file}" 2>/dev/null || stat -f%z "${chunk_file}" 2>/dev/null || echo 0)
+        if [ "$cur_sz" -ne "$expected_len" ]; then
+            log_warn "分片 $(printf "%02d" $i) 尺寸校验不一致 (${cur_sz}/${expected_len})，单独发起二次重传..."
+            rm -f "${chunk_file}"
+            if ! download_single_chunk "${url}" "${chunk_file}" "${start}" "${end}" "${expected_len}"; then
+                log_warn "分片 $(printf "%02d" $i) 二次重传失败。"
+                rm -rf "${DOWNLOAD_CHUNK_DIR}"
+                DOWNLOAD_CHUNK_DIR=""
+                return 1
+            fi
+        fi
     done
 
-    if [ $failed -eq 0 ]; then
-        log_info "8 分块并发传输完成，合并整合成最终安装包..."
-        cat "${chunk_dir}"/chunk_* > "${output}"
-        rm -rf "${chunk_dir}"
-        return 0
-    else
-        log_warn "分块传输部分失败，清理缓存重试..."
-        rm -rf "${chunk_dir}"
-        return 1
-    fi
+    # 边拼边删流式整合：避免占用双倍磁盘空间（额外峰值仅单个分块大小约 110MB）
+    log_info "所有 ${num_threads} 个分片校验一致，执行边拼边删流式整合成安装包..."
+    > "${output}"
+    for ((i=0; i<num_threads; i++)); do
+        local chunk_file="${DOWNLOAD_CHUNK_DIR}/chunk_$(printf "%02d" $i)"
+        cat "${chunk_file}" >> "${output}"
+        rm -f "${chunk_file}"
+    done
+
+    rm -rf "${DOWNLOAD_CHUNK_DIR}"
+    DOWNLOAD_CHUNK_DIR=""
+    return 0
 }
+
+# 优先检查当前执行目录是否存在有效安装包
+ORIGIN_PWD="${OLDPWD:-$PWD}"
+if [ -f "${ORIGIN_PWD}/${TAR_FILE}" ] && check_package_integrity "${ORIGIN_PWD}/${TAR_FILE}"; then
+    log_info "检测到执行目录已有完整安装包 ${TAR_FILE}，直接复用。"
+    cp -f "${ORIGIN_PWD}/${TAR_FILE}" "${TAR_FILE}"
+fi
 
 if check_package_integrity "${TAR_FILE}"; then
     log_info "检测到本地已有完整且校验无误的安装包 ${TAR_FILE}，跳过下载步骤。"
@@ -496,31 +678,41 @@ else
 
     DOWNLOAD_SUCCESS=0
 
-    # 优先执行内建 8 线程 Curl 分块并发传输
+    # 优先执行内建 8 线程 Curl 原生分块并发传输
     for URL in "${OFFICIAL_URLS[@]}"; do
-        if parallel_curl_download "${URL}" "${TAR_FILE}"; then
+        parallel_curl_download "${URL}" "${TAR_FILE}"
+        download_ret=$?
+        if [ $download_ret -eq 0 ]; then
             if check_package_integrity "${TAR_FILE}"; then
                 log_info "恭喜！使用 8 并发分块传输成功完成极速下载，并通过完整性校验！"
                 DOWNLOAD_SUCCESS=1
                 break
             fi
+        elif [ $download_ret -eq 2 ]; then
+            # 不支持 Range，无需在其他官方镜像上反复重试并发分片，直接转单线程断点续传
+            break
         fi
     done
 
-    # 兜底单线程断点续传
+    # 兜底单线程断点续传模式
     if [ "$DOWNLOAD_SUCCESS" -ne 1 ]; then
-        log_warn "分块传输未完成，退回经典单线程断点续传模式..."
+        log_warn "分块传输未完成或不支持 Range，转入原生断点续传模式..."
         for URL in "${OFFICIAL_URLS[@]}"; do
             log_info "下载节点: ${URL}"
-            if wget -c --timeout=30 --tries=3 "${URL}" -O "${TAR_FILE}"; then
-                if check_package_integrity "${TAR_FILE}"; then
-                    log_info "单线程下载完成并通过完整性校验！"
-                    DOWNLOAD_SUCCESS=1
-                    break
-                else
-                    log_warn "校验未通过，清理并尝试下一个节点..."
-                    rm -f "${TAR_FILE}"
-                fi
+            dl_ok=0
+            if command -v curl >/dev/null 2>&1; then
+                curl -L -A "${UA}" -C - --connect-timeout 20 --retry 3 --retry-delay 2 "${URL}" -o "${TAR_FILE}" && dl_ok=1 || dl_ok=0
+            elif command -v wget >/dev/null 2>&1; then
+                wget -c --timeout=30 --tries=3 "${URL}" -O "${TAR_FILE}" && dl_ok=1 || dl_ok=0
+            fi
+
+            if [ $dl_ok -eq 1 ] && check_package_integrity "${TAR_FILE}"; then
+                log_info "单线程下载完成并通过完整性校验！"
+                DOWNLOAD_SUCCESS=1
+                break
+            else
+                log_warn "校验未通过，清理未完成文件并尝试下一个节点..."
+                rm -f "${TAR_FILE}"
             fi
         done
     fi
@@ -535,8 +727,32 @@ log_info "正在解压并部署至路径 ${BASE_DIR} ..."
 mkdir -p "${BASE_DIR}"
 tar -xf "${TAR_FILE}" --strip-components=1 -C "${BASE_DIR}"
 
+# 赋予必要可执行权限，防止 Systemd 或子命令因 umask 导致执行权限缺失
+chmod +x "${BASE_DIR}/bin/"* 2>/dev/null || true
+chmod +x "${BASE_DIR}/support-files/mysql.server" 2>/dev/null || true
+
+# 解压完成后清理下载目录以释放磁盘空间
+log_info "安装包解压完成，清理临时下载目录以释放磁盘空间..."
+cd "${BASE_DIR}"
+rm -rf "${TMP_DOWNLOAD_DIR}"
+TMP_DOWNLOAD_DIR=""
+
 mkdir -p "${DATA_DIR}"
 mkdir -p "${LOG_DIR}"
+
+# 安全检查：如果数据目录已存在且非空，必须由用户显式确认才可继续覆盖
+if [ -d "${DATA_DIR}" ] && [ -n "$(ls -A "${DATA_DIR}" 2>/dev/null)" ]; then
+    log_warn "=========================================================================="
+    log_warn "【高危警告】检测到数据存储目录 ${DATA_DIR} 已存在且包含数据文件！"
+    log_warn "继续执行将清空该目录下的所有旧数据并重新初始化数据库！"
+    log_warn "=========================================================================="
+    read -p "请确认是否覆盖并清空现有数据？(输入 'yes' 继续，输入其他任意内容安全退出): " CONFIRM_OVERWRITE
+    if [ "${CONFIRM_OVERWRITE}" != "yes" ]; then
+        log_err "用户取消操作，部署已安全终止，未改动任何现有数据。"
+        exit 1
+    fi
+    log_warn "已获取用户授权，正在清空数据存储目录..."
+fi
 
 # 清理可能残留的旧数据与日志
 rm -rf "${DATA_DIR:?}"/*
@@ -582,7 +798,7 @@ init_connect = 'SET NAMES utf8mb4'
 max_allowed_packet = 1G
 replica_max_allowed_packet = 1G
 net_buffer_length = 16K
-max_connections = 2000
+max_connections = ${MAX_CONNECTIONS}
 max_connect_errors = 1000
 connect_timeout = 60
 wait_timeout = 600
@@ -598,7 +814,7 @@ log_bin_index = ${LOG_DIR}/binlog.index
 binlog_expire_logs_seconds = 864000
 max_binlog_size = 500M
 sync_binlog = 1
-binlog_cache_size = 32M
+binlog_cache_size = ${BINLOG_CACHE_SIZE}
 binlog_rows_query_log_events = OFF
 relay_log = ${LOG_DIR}/mysql-relay
 relay_log_index = ${LOG_DIR}/mysql-relay.index
@@ -616,7 +832,7 @@ innodb_log_group_home_dir = ${DATA_DIR}
 innodb_data_file_path = ibdata1:10M:autoextend
 innodb_buffer_pool_size = ${BUFFER_POOL_SIZE}
 innodb_redo_log_capacity = 2G
-innodb_log_buffer_size = 64M
+innodb_log_buffer_size = ${INNODB_LOG_BUFFER_SIZE}
 innodb_flush_log_at_trx_commit = 1
 innodb_flush_method = O_DIRECT
 innodb_file_per_table = ON
@@ -632,7 +848,7 @@ innodb_page_cleaners = 4
 innodb_purge_threads = 4
 innodb_read_io_threads = 8
 innodb_write_io_threads = 8
-innodb_sort_buffer_size = 64M
+innodb_sort_buffer_size = ${INNODB_SORT_BUFFER_SIZE}
 
 # ==================== 安全与认证 ====================
 default_authentication_plugin = mysql_native_password
@@ -651,20 +867,20 @@ log_bin_trust_function_creators = 1
 read_only = 0
 super_read_only = 0
 skip_external_locking = ON
-table_open_cache = 2000
-table_definition_cache = 1400
+table_open_cache = ${TABLE_OPEN_CACHE}
+table_definition_cache = ${TABLE_DEFINITION_CACHE}
 table_open_cache_instances = 16
 back_log = 3000
 thread_cache_size = 100
 thread_handling = one-thread-per-connection
-tmp_table_size = 256M
-max_heap_table_size = 256M
-sort_buffer_size = 2M
-join_buffer_size = 2M
-read_buffer_size = 2M
-read_rnd_buffer_size = 2M
-bulk_insert_buffer_size = 32M
-performance_schema = ON
+tmp_table_size = ${TMP_TABLE_SIZE}
+max_heap_table_size = ${MAX_HEAP_TABLE_SIZE}
+sort_buffer_size = ${SORT_BUFFER_SIZE}
+join_buffer_size = ${JOIN_BUFFER_SIZE}
+read_buffer_size = ${READ_BUFFER_SIZE}
+read_rnd_buffer_size = ${READ_RND_BUFFER_SIZE}
+bulk_insert_buffer_size = ${BULK_INSERT_BUFFER_SIZE}
+performance_schema = ${PERFORMANCE_SCHEMA}
 performance_schema_max_table_instances = 10000
 performance_schema_max_sql_text_length = 4096
 
@@ -699,7 +915,9 @@ log_info "配置文件 /etc/my.cnf 生成成功！"
 # ------------------------------------------------------------------------------
 log_step "Step 7: 初始化数据库"
 
-INIT_LOG="/tmp/mysql_init.log"
+INIT_LOG="/tmp/mysql_init_$$.log"
+touch "${INIT_LOG}"
+chmod 600 "${INIT_LOG}"
 log_info "正在执行 mysqld --initialize ..."
 
 set +e
@@ -716,6 +934,8 @@ TEMP_PASSWORD=$(grep "A temporary password" "${INIT_LOG}" "${LOG_DIR}/mysql.log"
 
 if [ -n "${TEMP_PASSWORD}" ] && [ $INIT_RET -eq 0 ]; then
     log_info "数据库初始化成功！"
+    rm -f "${INIT_LOG}" 2>/dev/null || true
+    INIT_LOG=""
 else
     log_err "数据库初始化失败！详情见以下日志输出:"
     echo "--------------------------------------------------------------------------"
@@ -792,8 +1012,8 @@ log_step "Step 9: Socket 就绪轮询、修改 root 密码并开启外部远程�
 
 log_info "等待 MySQL 监听 Socket (/tmp/mysql.sock) 准备就绪..."
 SOCKET_READY=0
-for ((i=1; i<=15; i++)); do
-    if ${INSTALL_DIR}/bin/mysqladmin ping -u root --socket=/tmp/mysql.sock >/dev/null 2>&1; then
+for ((i=1; i<=30; i++)); do
+    if [ -S /tmp/mysql.sock ] && "${INSTALL_DIR}/bin/mysql" --connect-expired-password -u root -p"${TEMP_PASSWORD}" -S /tmp/mysql.sock -e "SELECT 1;" >/dev/null 2>&1; then
         SOCKET_READY=1
         break
     fi
@@ -802,25 +1022,45 @@ done
 
 if [ $SOCKET_READY -ne 1 ]; then
     log_warn "Socket 轮询等待超时，尝试直接执行连接修改..."
+else
+    log_info "MySQL 监听 Socket 就绪并验证连接成功！"
 fi
 
+# 严格生成符合 MySQL 8.0 复杂性策略的 12 位高强度密码（含大写、小写、数字、特殊符号）
 generate_random_password() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -base64 16 | tr -dc 'A-Za-z0-9@#%&_' | head -c 12
+    local uppers="ABCDEFGHJKLMNPQRSTUVWXYZ"
+    local lowers="abcdefghijkmnpqrstuvwxyz"
+    local digits="23456789"
+    local specials="@#%&_"
+    
+    local p1
+    local p2
+    local p3
+    local p4
+    p1=$(tr -dc "${uppers}" < /dev/urandom 2>/dev/null | head -c 3 || echo "ABC")
+    p2=$(tr -dc "${lowers}" < /dev/urandom 2>/dev/null | head -c 3 || echo "xyz")
+    p3=$(tr -dc "${digits}" < /dev/urandom 2>/dev/null | head -c 3 || echo "888")
+    p4=$(tr -dc "${specials}" < /dev/urandom 2>/dev/null | head -c 3 || echo "@#_")
+    
+    local combined="${p1}${p2}${p3}${p4}"
+    if command -v shuf >/dev/null 2>&1; then
+        echo "${combined}" | fold -w1 | shuf | tr -d '\n'
     else
-        tr -dc 'A-Za-z0-9@#%&_' < /dev/urandom | head -c 12
+        echo "${combined}"
     fi
 }
 
 FINAL_ROOT_PASS=$(generate_random_password)
 
-PASS_UPDATE_LOG="/tmp/mysql_pass_update.log"
+PASS_UPDATE_LOG="/tmp/mysql_pass_update_$$.log"
+touch "${PASS_UPDATE_LOG}"
+chmod 600 "${PASS_UPDATE_LOG}"
 
 set +e
 ${INSTALL_DIR}/bin/mysql --connect-expired-password -u root -p"${TEMP_PASSWORD}" -S /tmp/mysql.sock <<EOF > "${PASS_UPDATE_LOG}" 2>&1
-ALTER USER 'root'@'localhost' IDENTIFIED BY '${FINAL_ROOT_PASS}';
-CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '${FINAL_ROOT_PASS}';
-ALTER USER 'root'@'%' IDENTIFIED BY '${FINAL_ROOT_PASS}';
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${FINAL_ROOT_PASS}';
+CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED WITH mysql_native_password BY '${FINAL_ROOT_PASS}';
+ALTER USER 'root'@'%' IDENTIFIED WITH mysql_native_password BY '${FINAL_ROOT_PASS}';
 GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 EOF
@@ -829,6 +1069,8 @@ set -e
 
 if [ $PASS_RET -eq 0 ]; then
     log_info "root 密码更新及外部远程访问 ('root'@'%') 设置成功！"
+    rm -f "${PASS_UPDATE_LOG}" 2>/dev/null || true
+    PASS_UPDATE_LOG=""
 else
     log_err "配置 root 密码或远程访问失败！报错日志如下 (${PASS_UPDATE_LOG}):"
     echo "--------------------------------------------------------------------------"
@@ -852,7 +1094,10 @@ echo "数据目录: ${DATA_DIR}"
 echo "日志目录: ${LOG_DIR}"
 echo "配置文件: /etc/my.cnf"
 echo "服务端口: ${PORT}"
-echo "分配 Buffer Pool: ${BUFFER_POOL_SIZE}"
+echo "部署模式: ${DEPLOY_MODE_NAME}"
+echo "分配 Buffer Pool: ${BUFFER_POOL_SIZE} (Instances: ${BUFFER_POOL_INSTANCES})"
+echo "Performance Schema: ${PERFORMANCE_SCHEMA}"
+echo "最大连接数: ${MAX_CONNECTIONS}"
 echo "外部访问: 已开启 ('root'@'%')"
 echo ""
 echo -e "${YELLOW}【重要】自动生成的 12 位 root 随机密码为:${NC} ${GREEN}${FINAL_ROOT_PASS}${NC}"
